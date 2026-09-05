@@ -38,12 +38,18 @@ def client() -> OpenAI:
     )
 
 
-def complete(system: str, user: str, *, max_tokens: int = 2048) -> str:
+def complete(system: str, user: str, *, max_tokens: int = 4096) -> str:
     """Single-turn completion.
 
     Temperature is pinned at zero and not exposed. Treasury output that differs
     between identical runs cannot be audited, and an auditor asking why the
     plan changed is not a conversation worth having.
+
+    GLM-4.7-Flash is a reasoning model: it fills a `reasoning` field before
+    `message.content`, burning ~450-500 completion tokens before any content
+    appears. A low max_tokens truncates the reasoning and leaves content
+    empty -- indistinguishable from a real empty answer unless we check
+    finish_reason explicitly.
     """
     response = client().chat.completions.create(
         model=os.environ.get("SLUICE_LLM_MODEL", DEFAULT_MODEL),
@@ -54,4 +60,12 @@ def complete(system: str, user: str, *, max_tokens: int = 2048) -> str:
         temperature=0.0,
         max_tokens=max_tokens,
     )
-    return response.choices[0].message.content or ""
+    choice = response.choices[0]
+    content = choice.message.content or ""
+    if choice.finish_reason == "length" or not content:
+        raise RuntimeError(
+            f"LLM response truncated or empty (finish_reason={choice.finish_reason!r}, "
+            f"max_tokens={max_tokens}). GLM-4.7-Flash burns ~450-500 tokens on "
+            "reasoning before content -- raise max_tokens if this recurs."
+        )
+    return content
