@@ -142,92 +142,139 @@ def _payable_candidate(conn: sqlite3.Connection, entity_id: str) -> dict | None:
 
 # --------------------------------------------------------------------------
 # Candidate remedy construction (deterministic -- no LLM in this path)
+#
+# Each shortfall entity can independently qualify for up to three remedy
+# kinds. Emitting one Remedy per (entity, kind) is an enumeration, not a
+# judgement -- a treasurer reading a dozen line items gets no more help than
+# a spreadsheet. Instead we consolidate by kind: one Remedy per kind, naming
+# every entity it covers, with amounts rolled up to USD so a multi-currency
+# course of action is still a single comparable number. This still produces
+# at most three or four candidates (revolver / soft-covenant / delay-payable,
+# optionally a combination), never per-entity duplicates.
 # --------------------------------------------------------------------------
 
-def _build_candidates(conn: sqlite3.Connection, shortfalls: list[Shortfall]) -> list[Remedy]:
-    candidates: list[Remedy] = []
+def _build_revolver_remedy(conn: sqlite3.Connection, shortfalls: list[Shortfall]) -> Remedy | None:
+    """Always offered, cheap and reversible, never touches the covenant
+    itself -- so every shortfall entity qualifies."""
+    if not shortfalls:
+        return None
+
+    per_entity = []
+    total_usd_minor = 0
     for sf in shortfalls:
         covenant = _entity_covenant(conn, sf.entity_id)
-        hard = bool(covenant) and covenant["hardness"] == HARD
-
-        # 1. Revolver draw -- always offered, cheap and reversible, never
-        #    touches the covenant itself.
         facility = "committed revolving facility"
         if covenant and covenant["kind"] == "overdraft_facility_minimum":
             facility = "group revolving credit facility (not the overdraft " \
                        "line the covenant itself measures)"
-        elif covenant and covenant["kind"] == "term_loan_minimum":
-            facility = "committed revolving facility"
-        candidates.append(Remedy(
-            action=f"Draw on {sf.entity_id}'s {facility}",
-            kind=REVOLVER,
-            entity_id=sf.entity_id,
-            amount_minor=sf.amount_minor,
-            currency=sf.currency,
-            business_cost=(
-                f"Facility interest on {to_major(sf.amount_minor)} {sf.currency} "
-                "while drawn; no vendor or covenant relationship affected."
-            ),
-            reversible=True,
-            requires_signoff=None,
-            rank=0,
-            rationale=(
-                f"Cheapest and fully reversible option against: {sf.line}"
-            ),
-        ))
+        per_entity.append(
+            f"{sf.entity_id} draws {to_major(sf.amount_minor)} {sf.currency} "
+            f"on its {facility}"
+        )
+        total_usd_minor += _usd_minor(conn, sf.amount_minor, sf.currency)
 
-        # 2. Soft covenant breach -- only when the entity's OWN floor is soft.
-        #    Never constructed when hard -- this is the structural guarantee.
+    entity_id = ", ".join(sf.entity_id for sf in shortfalls)
+    lines = "; ".join(sf.line for sf in shortfalls)
+    return Remedy(
+        action=f"Draw on revolving facilities at {entity_id}",
+        kind=REVOLVER,
+        entity_id=entity_id,
+        amount_minor=total_usd_minor,
+        currency="USD",
+        business_cost=(
+            "Facility interest while drawn; no vendor or covenant "
+            f"relationship affected. {'; '.join(per_entity)}."
+        ),
+        reversible=True,
+        requires_signoff=None,
+        rank=0,
+        rationale=(
+            "Cheapest and fully reversible option; covers every shortfall "
+            f"in full. Against: {lines}"
+        ),
+    )
+
+
+def _build_soft_covenant_remedy(conn: sqlite3.Connection, shortfalls: list[Shortfall]) -> Remedy | None:
+    """Only entities whose OWN floor is soft qualify. Never constructed for a
+    hard covenant -- this is the structural guarantee that a hard breach can
+    never appear in `remedies`, enforced here rather than left to the model."""
+    entries = []
+    for sf in shortfalls:
+        covenant = _entity_covenant(conn, sf.entity_id)
         if covenant and covenant["hardness"] == SOFT:
-            candidates.append(Remedy(
-                action=f"Accept a soft covenant breach at {sf.entity_id}",
-                kind=SOFT_COVENANT,
-                entity_id=sf.entity_id,
-                amount_minor=sf.amount_minor,
-                currency=sf.currency,
-                business_cost=(
-                    "Zero cash cost. Breaches internal policy "
-                    f"({covenant['source_doc']}), requires Group Treasurer "
-                    "sign-off, and is recoverable as soon as cash recovers."
-                ),
-                reversible=True,
-                requires_signoff="Group Treasurer",
-                rank=0,
-                rationale=(
-                    f"{sf.entity_id}'s floor is internal policy (soft), not "
-                    f"contractual, against: {sf.line}"
-                ),
-            ))
+            entries.append((sf, covenant))
+    if not entries:
+        return None
 
-        # 3. Delay a payable -- only when a genuine, non-statutory payable
-        #    exists to delay.
+    per_entity = [f"{sf.entity_id} ({covenant['source_doc']})" for sf, covenant in entries]
+    entity_id = ", ".join(sf.entity_id for sf, _ in entries)
+    total_usd_minor = sum(_usd_minor(conn, sf.amount_minor, sf.currency) for sf, _ in entries)
+    lines = "; ".join(sf.line for sf, _ in entries)
+    return Remedy(
+        action=f"Accept soft covenant breaches at {entity_id}",
+        kind=SOFT_COVENANT,
+        entity_id=entity_id,
+        amount_minor=total_usd_minor,
+        currency="USD",
+        business_cost=(
+            f"Zero cash cost. Breaches internal policy at {', '.join(per_entity)}, "
+            "requires Group Treasurer sign-off, and is recoverable as soon "
+            "as cash recovers."
+        ),
+        reversible=True,
+        requires_signoff="Group Treasurer",
+        rank=0,
+        rationale=(
+            "These entities' floors are internal policy (soft), not "
+            f"contractual. Against: {lines}"
+        ),
+    )
+
+
+def _build_delay_payable_remedy(conn: sqlite3.Connection, shortfalls: list[Shortfall]) -> Remedy | None:
+    """Only entities with a genuine, non-statutory payable to delay qualify."""
+    entries = []
+    for sf in shortfalls:
         payable = _payable_candidate(conn, sf.entity_id)
         if payable is not None:
             amount = min(sf.amount_minor, payable["amount_minor"])
-            candidates.append(Remedy(
-                action=f"Delay {sf.entity_id}'s payment: {payable['note']}",
-                kind=DELAY_PAYABLE,
-                entity_id=sf.entity_id,
-                amount_minor=amount,
-                currency=sf.currency,
-                business_cost=(
-                    f"Frees {to_major(amount)} {sf.currency} by holding "
-                    f"back \"{payable['note']}\" (day {payable['day']}). "
-                    "Damages the counterparty relationship and is not "
-                    "recovered by paying later."
-                ),
-                reversible=False,
-                requires_signoff=None,
-                rank=0,
-                rationale=f"Only non-statutory payable available against: {sf.line}",
-            ))
+            entries.append((sf, payable, amount))
+    if not entries:
+        return None
 
-        if hard:
-            # No remedy here ever proposes breaching this covenant -- noted
-            # in Diagnosis.explanation, not silently dropped.
-            pass
+    per_entity = [
+        f"\"{payable['note']}\" at {sf.entity_id} (day {payable['day']})"
+        for sf, payable, _ in entries
+    ]
+    entity_id = ", ".join(sf.entity_id for sf, _, _ in entries)
+    total_usd_minor = sum(_usd_minor(conn, amount, sf.currency) for sf, _, amount in entries)
+    lines = "; ".join(sf.line for sf, _, _ in entries)
+    return Remedy(
+        action=f"Delay payables at {entity_id}",
+        kind=DELAY_PAYABLE,
+        entity_id=entity_id,
+        amount_minor=total_usd_minor,
+        currency="USD",
+        business_cost=(
+            f"Frees cash by holding back {', '.join(per_entity)}. Damages "
+            "each counterparty relationship and is not recovered by paying "
+            "later."
+        ),
+        reversible=False,
+        requires_signoff=None,
+        rank=0,
+        rationale=f"Only non-statutory payables available. Against: {lines}",
+    )
 
-    return candidates
+
+def _build_candidates(conn: sqlite3.Connection, shortfalls: list[Shortfall]) -> list[Remedy]:
+    candidates = [
+        _build_revolver_remedy(conn, shortfalls),
+        _build_soft_covenant_remedy(conn, shortfalls),
+        _build_delay_payable_remedy(conn, shortfalls),
+    ]
+    return [c for c in candidates if c is not None]
 
 
 def _deterministic_order(candidates: list[Remedy]) -> list[Remedy]:
@@ -309,8 +356,9 @@ def _llm_prompt(conn: sqlite3.Connection, plan: Plan, shortfalls: list[Shortfall
         "one. Do not paraphrase or combine entries into a new sentence. "
         "ranked_ids must be a permutation of every candidate id, best first: "
         "revolver draws before soft-covenant breaches before delayed "
-        "payables, and within each group prefer the entity with the larger "
-        "shortfall. explanation is 2-4 sentences. If any entity in play has "
+        "payables. Each candidate is already a consolidated course of "
+        "action covering every entity it names -- do not ask for it to be "
+        "split back out by entity. explanation is 2-4 sentences. If any entity in play has "
         "a hard covenant, say explicitly in explanation that breaching it "
         "was never considered and why."
     )

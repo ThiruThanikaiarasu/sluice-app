@@ -18,7 +18,7 @@ from . import diagnosis, solver
 from .models import HARD
 from .seed import seed
 
-REJECTED_ACTION = "Delay MER-CA's payment: Office lease prepayment"
+REJECTED_ACTION = "Delay payables at MER-IE, MER-SG, MER-CA"
 
 
 def _conn(scenario, name):
@@ -40,10 +40,10 @@ def test_diagnose_names_a_specific_binding_constraint():
     assert len(d.binding_constraint) > 20
 
 
-def test_diagnose_produces_three_or_more_ranked_remedies_with_amounts_and_costs():
+def test_diagnose_produces_three_or_four_consolidated_remedies():
     conn, plan = _infeasible_plan()
     d = diagnosis.diagnose(conn, plan)
-    assert len(d.remedies) >= 3
+    assert 3 <= len(d.remedies) <= 4
     ranks = [r.rank for r in d.remedies]
     assert ranks == list(range(1, len(d.remedies) + 1))
     for r in d.remedies:
@@ -55,19 +55,20 @@ def test_diagnose_produces_three_or_more_ranked_remedies_with_amounts_and_costs(
 def test_no_hard_covenant_ever_appears_in_remedies():
     conn, plan = _infeasible_plan()
     d = diagnosis.diagnose(conn, plan)
+
+    hard_ids = {
+        sf_entity_id for sf_entity_id in
+        (eid for r in d.remedies for eid in r.entity_id.split(", "))
+        if (c := diagnosis._entity_covenant(conn, sf_entity_id)) and c["hardness"] == HARD
+    }
+    assert hard_ids == {"MER-IE", "MER-UK"}
+
     for r in d.remedies:
-        covenant = diagnosis._entity_covenant(conn, r.entity_id)
-        if covenant and covenant["hardness"] == HARD:
-            assert r.kind != diagnosis.SOFT_COVENANT, (
-                f"remedy proposes softening a hard covenant at {r.entity_id}"
+        entities = r.entity_id.split(", ")
+        if r.kind == diagnosis.SOFT_COVENANT:
+            assert not hard_ids.intersection(entities), (
+                f"remedy proposes softening a hard covenant: {entities}"
             )
-    hard_ids = [
-        eid for eid in {r.entity_id for r in d.remedies}
-        if (c := diagnosis._entity_covenant(conn, eid)) and c["hardness"] == HARD
-    ]
-    assert set(hard_ids) == {"MER-IE", "MER-UK"}
-    for eid in hard_ids:
-        assert all(r.kind != diagnosis.SOFT_COVENANT for r in d.remedies if r.entity_id == eid)
 
 
 def test_override_removes_rejected_remedy_from_next_run():
