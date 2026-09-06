@@ -63,8 +63,9 @@ class FXTable:
         if base == quote:
             return amount
         # round(), not int(): truncation shorts the receiving side by up to a
-        # minor unit and rounds negative amounts the wrong way (toward zero
-        # instead of toward -infinity). Matches solver.leg_cost's convention.
+        # minor unit, and for a negative amount it rounds the wrong way --
+        # toward zero rather than to the nearest minor unit. Matches
+        # solver.leg_cost's convention.
         return round(amount * self.rate(base, quote).effective)
 
     def spread_cost(self, amount: int, base: str, quote: str) -> int:

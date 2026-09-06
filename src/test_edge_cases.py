@@ -24,25 +24,31 @@ def _fx_conn(rows):
     return conn
 
 
-def test_cross_rate_is_deterministic_regardless_of_via_currency_order():
-    # Two candidate `via` currencies (B and C) both bridge A -> D. Repeated
-    # FXTable construction from the same rows must always pick the same one.
+def test_cross_rate_picks_the_lexicographically_first_via_currency():
+    # Two candidate `via` currencies (B and C) both bridge A -> D, at
+    # different rates. Within a single process, iterating the same `set` of
+    # currency string literals is stable regardless of hash randomization --
+    # repeated construction can't distinguish "sorted" from "unsorted but
+    # stable this run". Assert against the specific via the sort guarantees
+    # (B, alphabetically before C) instead: the unsorted implementation could
+    # just as easily have picked C's rate (5.0 * 7.0 = 35.0) here.
     rows = [
         ("A", "B", 2.0, 10),
         ("B", "D", 3.0, 10),
         ("A", "C", 5.0, 10),
         ("C", "D", 7.0, 10),
     ]
-    quotes = {FXTable(_fx_conn(rows)).rate("A", "D").mid for _ in range(20)}
-    assert len(quotes) == 1
+    fx = FXTable(_fx_conn(rows))
+    assert fx.rate("A", "D").mid == 2.0 * 3.0
 
 
 def test_convert_rounds_instead_of_truncating():
-    conn = _fx_conn([("A", "B", 1.0005, 0)])
+    conn = _fx_conn([("A", "B", 1.0015, 0)])
     fx = FXTable(conn)
-    # 1000 * 1.0005 = 1000.5 -> rounds to 1000 or 1001, never truncates to 1000
-    # in a way that disagrees with round().
-    assert fx.convert(1000, "A", "B") == round(1000 * 1.0005)
+    # 1000 * 1.0015 = 1001.5 -- int() truncates to 1001, round() to 1002.
+    # (A value ending in exactly .5 at an odd integer, not .0005 landing on
+    # an already-even 1000, where int() and round() agree by coincidence.)
+    assert fx.convert(1000, "A", "B") == 1002
 
 
 def test_convert_same_currency_is_identity():
@@ -109,13 +115,41 @@ def test_memo_facts_compute_delta_when_baseline_feasible(tmp_path):
     assert facts["delta_pct"] is not None
 
 
-def test_entity_covenant_prefers_hard_over_soft(tmp_path):
-    conn = seed("base", db_path=tmp_path / "covenant.db")
-    # MER-SG normally has only a soft covenant; add a hard one too.
+def _add_covenant(conn, entity_id, threshold_minor, hardness, currency="USD"):
     conn.execute(
         "INSERT INTO covenant (entity_id, kind, threshold, currency, hardness) "
-        "VALUES ('MER-SG', 'test_hard', 100000, 'USD', 'hard')"
+        "VALUES (?, 'test_covenant', ?, ?, ?)",
+        (entity_id, threshold_minor, currency, hardness),
     )
+
+
+def test_entity_covenant_matches_the_threshold_binding_floors_actually_uses(tmp_path):
+    # MER-SG's seeded covenant is soft at 200_000 major units. binding_floors()
+    # takes the max threshold regardless of hardness, so whichever covenant
+    # _entity_covenant() returns must be the one that threshold actually came
+    # from -- reporting the wrong one would make diagnose() call an entity
+    # "hard-bound" (or not) for a floor it isn't actually bound by.
+    conn = seed("base", db_path=tmp_path / "covenant.db")
+    _add_covenant(conn, "MER-SG", 10_000_000, "hard")  # 100_000.00, lower
+    floors = positions.binding_floors(conn)
+    covenant = diagnosis._entity_covenant(conn, "MER-SG")
+    assert covenant["threshold"] == floors["MER-SG"]
+    assert covenant["hardness"] == "soft"
+
+
+def test_entity_covenant_prefers_hard_when_its_threshold_is_the_binding_one(tmp_path):
+    conn = seed("base", db_path=tmp_path / "covenant.db")
+    _add_covenant(conn, "MER-SG", 30_000_000, "hard")  # 300_000.00, higher
+    floors = positions.binding_floors(conn)
+    covenant = diagnosis._entity_covenant(conn, "MER-SG")
+    assert covenant["threshold"] == floors["MER-SG"]
+    assert covenant["hardness"] == "hard"
+
+
+def test_entity_covenant_prefers_hard_on_a_threshold_tie(tmp_path):
+    conn = seed("base", db_path=tmp_path / "covenant.db")
+    # MER-SG's seeded soft covenant is exactly 200_000.00 major units.
+    _add_covenant(conn, "MER-SG", 20_000_000, "hard")
     covenant = diagnosis._entity_covenant(conn, "MER-SG")
     assert covenant["hardness"] == "hard"
 
@@ -149,6 +183,25 @@ def test_apply_llm_result_rejects_ranking_that_violates_priority_classes():
     bad_ranking = '{"ranked_ids": [1, 0]}'
     remedies, _ = diagnosis._apply_llm_result(candidates, bad_ranking)
     assert remedies[0].kind == diagnosis.REVOLVER
+
+
+def test_apply_llm_result_handles_non_object_json_without_crashing():
+    candidates = [_remedy(diagnosis.REVOLVER, "E1", 100)]
+    for raw in ("null", '"just a string"', "[1, 2, 3]", "42"):
+        remedies, data = diagnosis._apply_llm_result(candidates, raw)
+        assert len(remedies) == 1
+        assert data == {}
+
+
+def test_apply_llm_result_rejects_float_ranked_ids():
+    candidates = [
+        _remedy(diagnosis.REVOLVER, "E1", 100),
+        _remedy(diagnosis.REVOLVER, "E2", 50),
+    ]
+    # 0.0 == 0 and hashes equal, so a naive `set(ranked_ids) == set(range(n))`
+    # check would accept this and then `candidates[0.0]` would raise TypeError.
+    remedies, _ = diagnosis._apply_llm_result(candidates, '{"ranked_ids": [0.0, 1]}')
+    assert len(remedies) == 2
 
 
 def test_apply_llm_result_handles_duplicate_candidates_without_dropping_one():

@@ -24,7 +24,10 @@ from .seed import seed
 # since the whole point of `diagnose()` is that it runs unmodified against
 # the real model. Without a key configured, skip rather than fail: a missing
 # credential in a dev/CI environment is not the same signal as a real defect.
-pytestmark = pytest.mark.skipif(
+# Applied per-test rather than as a module-level pytestmark so that
+# test_diagnose_raises_on_feasible_plan -- which raises before diagnose()
+# ever reaches the LLM call -- still runs without a key.
+requires_llm = pytest.mark.skipif(
     not os.environ.get("SLUICE_LLM_API_KEY"),
     reason="requires a live SLUICE_LLM_API_KEY",
 )
@@ -43,6 +46,7 @@ def _infeasible_plan(tmp_path):
     return conn, plan
 
 
+@requires_llm
 def test_diagnose_names_a_specific_binding_constraint(tmp_path):
     conn, plan = _infeasible_plan(tmp_path)
     d = diagnosis.diagnose(conn, plan)
@@ -51,6 +55,7 @@ def test_diagnose_names_a_specific_binding_constraint(tmp_path):
     assert len(d.binding_constraint) > 20
 
 
+@requires_llm
 def test_diagnose_produces_three_or_four_consolidated_remedies(tmp_path):
     conn, plan = _infeasible_plan(tmp_path)
     d = diagnosis.diagnose(conn, plan)
@@ -63,6 +68,7 @@ def test_diagnose_produces_three_or_four_consolidated_remedies(tmp_path):
         assert r.action.strip()
 
 
+@requires_llm
 def test_no_hard_covenant_ever_appears_in_remedies(tmp_path):
     conn, plan = _infeasible_plan(tmp_path)
     d = diagnosis.diagnose(conn, plan)
@@ -82,6 +88,7 @@ def test_no_hard_covenant_ever_appears_in_remedies(tmp_path):
             )
 
 
+@requires_llm
 def test_override_removes_rejected_remedy_from_next_run(tmp_path):
     conn, plan = _infeasible_plan(tmp_path)
     first = diagnosis.diagnose(conn, plan)
@@ -95,6 +102,7 @@ def test_override_removes_rejected_remedy_from_next_run(tmp_path):
     assert not any(r.action == REJECTED_ACTION for r in second.remedies)
 
 
+@requires_llm
 def test_override_survives_a_changed_shortfall_set(tmp_path):
     """A rejection is keyed on (kind, entity), not on the exact set of
     entities that happened to be short in the run it was recorded in. If
@@ -124,6 +132,7 @@ def test_override_survives_a_changed_shortfall_set(tmp_path):
     )
 
 
+@requires_llm
 def test_override_is_per_entity_not_per_kind(tmp_path):
     """A rejection excludes only the entities named in the rejected remedy,
     not every entity that could ever qualify for that kind -- otherwise
@@ -149,6 +158,7 @@ def test_override_is_per_entity_not_per_kind(tmp_path):
     assert entities == {"MER-IE", "MER-SG"}
 
 
+@requires_llm
 def test_diagnose_does_not_crash_when_every_remedy_is_rejected(tmp_path):
     """Rejecting a consolidated course excludes every entity it names for
     that kind, so rejecting all three courses is enough to leave zero

@@ -97,19 +97,24 @@ Shortfall = FloorShortfall
 
 
 def _entity_covenant(conn: sqlite3.Connection, entity_id: str) -> dict | None:
-    """The entity's binding covenant, hard ones preferred.
+    """The entity's actually-binding covenant: the one whose threshold
+    positions.binding_floors() would pick (the max across all of the
+    entity's covenants), hard preferred only to break a tie.
 
-    The schema permits more than one covenant per entity (positions.py's
-    binding_floors() already takes the max threshold across them). Without an
-    explicit preference, whichever row SQLite happened to return first could
-    be a soft covenant even when a hard one also exists for this entity --
-    silently defeating the "a hard covenant is never treated as negotiable"
-    guarantee this module exists to enforce.
+    The schema permits more than one covenant per entity. Sorting by
+    hardness alone (ignoring threshold) would disagree with
+    binding_floors() whenever the *soft* covenant carries the higher
+    threshold: the solver enforces that higher soft floor, but this would
+    report the entity as hard-bound and wrongly suppress a soft-covenant
+    remedy for a floor that is in fact soft. Sorting by threshold first
+    still protects the original concern -- a hard covenant with the higher
+    threshold is still selected, so a soft-breach remedy is never proposed
+    when doing so would actually cross the hard floor.
     """
     rows = conn.execute(
         "SELECT entity_id, kind, threshold, currency, hardness, source_doc, "
         "source_quote FROM covenant WHERE entity_id = ? "
-        "ORDER BY CASE hardness WHEN ? THEN 0 ELSE 1 END, threshold DESC",
+        "ORDER BY threshold DESC, CASE hardness WHEN ? THEN 0 ELSE 1 END",
         (entity_id, HARD),
     ).fetchone()
     return dict(rows) if rows else None
@@ -409,11 +414,17 @@ def _apply_llm_result(candidates: list[Remedy], raw: str) -> tuple[list[Remedy],
         data = json.loads(raw)
     except json.JSONDecodeError:
         data = {}
+    if not isinstance(data, dict):
+        # Valid JSON that isn't an object -- null, a bare string, a model
+        # wrapping its object in a top-level array -- would otherwise crash
+        # on data.get(...) here and again in diagnose() below.
+        data = {}
 
     n = len(candidates)
 
     ranked_ids = data.get("ranked_ids")
     if (isinstance(ranked_ids, list) and len(ranked_ids) == n
+            and all(isinstance(i, int) and not isinstance(i, bool) for i in ranked_ids)
             and set(ranked_ids) == set(range(n))
             and _respects_priority_classes(candidates, ranked_ids)):
         order = ranked_ids

@@ -81,6 +81,7 @@ def solve_scenario(scenario: str):
         summary = positions_mod.summarise(conn)
         opening = positions_mod.opening_balances(conn)
         run_metrics = metrics.measure(conn, plan, naive)
+        metrics.persist(conn, run_metrics)
     finally:
         conn.close()
     return {
@@ -139,7 +140,13 @@ def reject_remedy(scenario: str, remedy, reason: str, run_id: str) -> None:
     conn = _connect(scenario)
     conn.row_factory = sqlite3.Row
     try:
-        record_override(conn, remedy, reason, run_id)
+        if HAS_TRACING:
+            tracing.traced_record_override(
+                lambda: record_override(conn, remedy, reason, run_id),
+                scenario=scenario, rule_text=remedy.action,
+            )
+        else:
+            record_override(conn, remedy, reason, run_id)
         conn.commit()
     finally:
         conn.close()
@@ -325,6 +332,12 @@ def main() -> None:
     render_memo(scenario, data)
     st.divider()
     render_escalation(scenario, data)
+
+    if HAS_TRACING:
+        # Flush at the end of each script run, not just at process exit --
+        # a batched exporter that only flushes on interpreter shutdown never
+        # actually flushes in a long-lived Streamlit server process.
+        tracing.flush()
 
 
 if __name__ == "__main__":
