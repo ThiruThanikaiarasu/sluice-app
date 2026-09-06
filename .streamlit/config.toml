@@ -1,0 +1,103 @@
+# Sluice theme -- the Agent Orchestrator design language (knowledge-base/DESIGN.md).
+#
+# Everything that Streamlit can express natively lives here so the repaint stays
+# out of the application code. The three signature moves that have no native
+# option -- global -0.5px tracking, inverted pill buttons, and the focus ring --
+# are applied as CSS in `src/theme.py`.
+
+[theme]
+base = "dark"
+
+# --- Type ---------------------------------------------------------------
+# Geist Sans with IBM Plex Mono for code, each with a system fallback stack so
+# the app still renders correctly when Google Fonts is unreachable.
+font = "Geist:https://fonts.googleapis.com/css2?family=Geist:wght@300..700&display=swap, ui-sans-serif, system-ui, -apple-system, sans-serif"
+codeFont = "IBM Plex Mono:https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&display=swap, ui-monospace, SFMono-Regular, monospace"
+baseFontSize = 16
+baseFontWeight = 400
+codeFontSize = "0.875rem"
+
+# Headings get lighter as they get bigger -- the hero has presence from size,
+# not weight. Sizes are stepped down one notch from the marketing scale
+# (76/48/36) because this is a dense operator screen, not a landing page; the
+# weight and line-height relationships are what carry the character.
+headingFontSizes = ["3rem", "2rem", "1.5rem", "1.25rem", "1.0625rem", "0.9375rem"]
+headingFontWeights = [400, 600, 500, 500, 500, 500]
+
+metricValueFontSize = "2rem"
+metricValueFontWeight = 400
+
+# --- Surfaces -----------------------------------------------------------
+# Warm near-black: every neutral carries a slight olive cast, which reads
+# softer than a blue-grey dark mode.
+backgroundColor = "#0c0c09"           # page canvas
+secondaryBackgroundColor = "#1d1d16"  # cards, sidebar, table headers
+textColor = "#fbfbf9"                 # 18.9:1 on canvas -- AAA
+
+# Brand burnt orange, used only for focus moments and small accents, never as
+# a primary fill. Links use the lighter brand tint, which reaches 7.1:1 (AAA)
+# where the base brand would only reach 4.7:1.
+primaryColor = "#d25611"
+linkColor = "#e8804a"
+linkUnderline = true
+
+# Controls get the stronger alpha by default. Translucent white at the
+# design's 10% is only 1.6:1 against the surface it sits on -- below the 3:1
+# that WCAG 1.4.11 asks of a boundary that identifies a control. 35% clears it
+# on the canvas, the card and the muted surface alike. Decorative edges (cards,
+# dividers, tables) are softened back to 10% in `src/theme.py`, so if that CSS
+# ever stops matching, the failure is a slightly louder outline rather than an
+# unidentifiable input.
+borderColor = "rgba(255, 255, 255, 0.35)"
+dataframeBorderColor = "rgba(255, 255, 255, 0.10)"
+dataframeHeaderBackgroundColor = "#1d1d16"
+showWidgetBorder = true
+showSidebarBorder = true
+
+# Cards and panels at 8px; buttons are full pills.
+baseRadius = "0.5rem"
+buttonRadius = "full"
+
+# --- Code ---------------------------------------------------------------
+# rgba(28,28,21,0.70) resolved against the canvas. Muted foreground on it is
+# 7.7:1 -- the design notes flag code as the page's weakest pairing, so this
+# uses the muted token rather than white at 80% opacity.
+codeBackgroundColor = "#171711"
+codeTextColor = "#abab9c"
+
+# --- Status ------------------------------------------------------------
+# The kanban status-dot hues, reused for Streamlit's alert and badge slots.
+# Each background is its hue at 15% over the canvas; every text/background
+# pairing below was measured at 5.6:1 or better.
+redColor = "#ff6467"
+redTextColor = "#ff6467"
+redBackgroundColor = "#301917"
+
+orangeColor = "#fb923c"
+orangeTextColor = "#fb923c"
+orangeBackgroundColor = "#302011"
+
+yellowColor = "#facc15"
+yellowTextColor = "#facc15"
+yellowBackgroundColor = "#30290b"
+
+greenColor = "#4ade80"
+greenTextColor = "#4ade80"
+greenBackgroundColor = "#152c1b"
+
+blueColor = "#60a5fa"
+blueTextColor = "#60a5fa"
+blueBackgroundColor = "#19232d"
+
+grayColor = "#abab9c"
+grayTextColor = "#abab9c"
+grayBackgroundColor = "#2b2b22"
+
+violetColor = "#e8804a"
+violetTextColor = "#e8804a"
+violetBackgroundColor = "#2b2b22"
+
+# --- Charts -------------------------------------------------------------
+# A monochrome warm-neutral ramp: colour is not used to distinguish series.
+chartCategoricalColors = ["#d8d8d0", "#7c7c67", "#5b5b4b", "#474739", "#2b2b22"]
+chartSequentialColors = ["#14140f", "#1d1d16", "#2b2b22", "#3a3a2e", "#474739", "#5b5b4b", "#6b6b58", "#7c7c67", "#abab9c", "#d8d8d0"]
