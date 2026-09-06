@@ -18,15 +18,26 @@ from __future__ import annotations
 
 import os
 from functools import lru_cache
+from typing import TYPE_CHECKING
 
-from openai import OpenAI
+if TYPE_CHECKING:
+    from openai import OpenAI
 
 DEFAULT_BASE_URL = "https://api.tensormux.com/v1"
 DEFAULT_MODEL = "glm-4-7-flash"
 
 
 @lru_cache(maxsize=1)
-def client() -> OpenAI:
+def client() -> "OpenAI":
+    # Imported here, not at module top level: neatlogs instruments OpenAI by
+    # patching it at import time, so anything that imports the client before
+    # neatlogs.init() runs gets an unpatched client and silently produces no
+    # trace. Deferring the import into this lru_cache'd function means the
+    # import happens on first real use rather than at `import src.llm` time,
+    # so init() only has to run before the first call, not before every other
+    # module that might transitively import llm.py.
+    from openai import OpenAI
+
     api_key = os.environ.get("SLUICE_LLM_API_KEY")
     if not api_key:
         raise RuntimeError(
