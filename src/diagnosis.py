@@ -125,14 +125,23 @@ def _revolver_facility(conn: sqlite3.Connection, entity_id: str) -> dict | None:
     db seeded before `revolver_facility` existed in schema.sql (that db file
     survives across runs and branches, and `_ensure_seeded()` only seeds
     once) -- either way, the revolver remedy is simply not offered for this
-    entity rather than raising `no such table` out of a diagnosis run."""
+    entity rather than raising `no such table` out of a diagnosis run.
+
+    Only that specific, expected error is swallowed. `OperationalError` also
+    covers `database is locked`, `disk I/O error`, `readonly database` and a
+    genuine schema typo -- silently reading any of those as "no facility"
+    would drop the cheapest, first-ranked, fully reversible remedy in front
+    of a treasurer with no indication anything went wrong.
+    """
     try:
         row = conn.execute(
             "SELECT entity_id, lender, limit_minor, currency, rate_bps, source_doc "
             "FROM revolver_facility WHERE entity_id = ?",
             (entity_id,),
         ).fetchone()
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc):
+            raise
         return None
     return dict(row) if row else None
 

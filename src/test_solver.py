@@ -6,6 +6,8 @@ from __future__ import annotations
 import pytest
 
 from . import baseline, solver
+from .db import horizon_start
+from .models import is_weekend
 from .seed import seed
 
 
@@ -45,6 +47,31 @@ def test_infeasible_scenario_reports_specific_binding_constraints(tmp_path):
         assert len(line) > 20
         assert "problem is infeasible" not in line.lower()
     assert solver.verify(conn, plan) == []
+
+
+@pytest.mark.parametrize("scenario", ["base", "covenant_shock"])
+def test_no_transfer_is_sent_or_lands_on_a_weekend(scenario, tmp_path):
+    conn = _conn(scenario, tmp_path)
+    plan = solver.solve(conn, scenario)
+    start = horizon_start(conn)
+    for t in plan.transfers:
+        assert not is_weekend(t.send_day, start), t
+        assert not is_weekend(t.land_day, start), t
+
+
+def test_buffer_penalty_is_charged_once_per_entity_not_per_entity_day(tmp_path):
+    """Regression guard for a real bug: an earlier revision created one
+    buffer-slack variable per entity *per day* and charged all of them,
+    compounding a persisting gap to ~10x a single leg's real FX spread over
+    the horizon so the solver paid genuine cost chasing a notional buffer
+    instead of treating it as a tie-break. The fix shares one slack variable
+    per entity across every day, charged once. This pins the known-correct
+    cost so the per-day version (which produced 242,755 on `base`, not
+    241,455) can't silently come back.
+    """
+    conn = _conn("base", tmp_path)
+    plan = solver.solve(conn, "base")
+    assert plan.total_cost_minor == 241_455
 
 
 def test_covenant_shock_ireland_flips_from_lender_to_borrower(tmp_path):

@@ -412,7 +412,6 @@ def solve(conn: sqlite3.Connection, scenario: str) -> Plan:
         # gap into a cost many times larger than the real spread of actually
         # moving cash to close it, which stops being a tie-break.
         buffer_slack = pulp.LpVariable(f"buffer_slack_{e}", lowBound=0)
-        buffer_charged = False
         cum_flow = 0
         for d in range(HORIZON_DAYS):
             cum_flow += flows.get(e, {}).get(d, 0)
@@ -428,11 +427,11 @@ def solve(conn: sqlite3.Connection, scenario: str) -> Plan:
                 prob += expr >= floors.get(e, 0), f"floor_{e}_{d}"
                 prob += expr >= 0, f"nonneg_{e}_{d}"
                 prob += expr + buffer_slack >= buffer_target, f"buffer_{e}_{d}"
-                if not buffer_charged:
-                    objective_terms.append(
-                        buffer_slack * (BUFFER_PENALTY_BPS / 10_000) * usd_rate[ce]
-                    )
-                    buffer_charged = True
+        # Charged once per entity here, after the day loop, regardless of how
+        # many (or zero) days actually constrained buffer_slack above.
+        objective_terms.append(
+            buffer_slack * (BUFFER_PENALTY_BPS / 10_000) * usd_rate[ce]
+        )
 
     prob += pulp.lpSum(objective_terms)
 

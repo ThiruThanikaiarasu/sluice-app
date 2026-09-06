@@ -111,13 +111,18 @@ CREATE TABLE revolver_facility (
 
 -- Every Approve/Reject decision a treasurer makes in the UI, so an approved
 -- remedy leaves a durable record instead of a toast that disappears on
--- rerun.
+-- rerun. One row per entity a consolidated remedy names (diagnosis.py's
+-- Remedy.entity_id is a comma-joined list covering every entity a course of
+-- action applies to) -- `entity_id` here, like everywhere else in this
+-- schema, is always a single entity, queryable the same way. `amount_minor`
+-- and `currency` describe the whole course's rolled-up USD total, not a
+-- per-entity split, and are replicated onto each of that course's rows.
 CREATE TABLE decision_log (
     id           INTEGER PRIMARY KEY,
     run_id       TEXT NOT NULL,
     action       TEXT NOT NULL,
     remedy_kind  TEXT NOT NULL,
-    entity_id    TEXT NOT NULL,
+    entity_id    TEXT NOT NULL REFERENCES entity(id),
     amount_minor INTEGER NOT NULL,
     currency     TEXT NOT NULL,
     decision     TEXT NOT NULL CHECK (decision IN ('approved', 'rejected')),

@@ -39,6 +39,36 @@ def _conn(scenario, name, tmp_path):
     return seed(scenario, db_path=tmp_path / f"sluice_test_diag_{name}.db")
 
 
+def test_revolver_remedy_caps_the_draw_at_the_facility_limit(tmp_path):
+    """Pure-Python remedy construction, no LLM involved. MER-CA's seeded
+    revolver_facility limit is USD 500,000 (RBC) -- a shortfall larger than
+    that must be capped, not offered in full against a facility that doesn't
+    have the room, and the business_cost must say so rather than silently
+    understating what the lever actually closes."""
+    conn = _conn("base", "revolver_cap", tmp_path)
+    shortfall = solver.FloorShortfall(
+        entity_id="MER-CA", currency="USD", amount_minor=70_000_000,
+        day=5, line="MER-CA short 700000.00 USD of its floor on day 5",
+    )
+    remedy = diagnosis._build_revolver_remedy(conn, [shortfall], set())
+    assert remedy is not None
+    assert remedy.entity_id == "MER-CA"
+    assert remedy.amount_minor == 50_000_000  # capped at the 500,000 USD limit
+    assert "covers" in remedy.business_cost
+
+
+def test_revolver_remedy_omits_an_entity_with_no_seeded_facility(tmp_path):
+    conn = _conn("base", "revolver_missing", tmp_path)
+    shortfall = solver.FloorShortfall(
+        entity_id="MER-CA", currency="USD", amount_minor=10_000,
+        day=5, line="MER-CA short 100.00 USD of its floor on day 5",
+    )
+    conn.execute("DELETE FROM revolver_facility WHERE entity_id = 'MER-CA'")
+    conn.commit()
+    remedy = diagnosis._build_revolver_remedy(conn, [shortfall], set())
+    assert remedy is None
+
+
 def _infeasible_plan(tmp_path):
     conn = _conn("infeasible", "diag", tmp_path)
     plan = solver.solve(conn, "infeasible")

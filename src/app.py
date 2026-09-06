@@ -159,7 +159,13 @@ def _ensure_decision_log_table(conn: sqlite3.Connection) -> None:
     created, and that file survives across runs and across branches -- so a
     db seeded before `decision_log` existed in schema.sql would otherwise
     make every write/read here raise `no such table`. Same fix metrics.py
-    already uses for `run_metrics`."""
+    already uses for `run_metrics`.
+
+    Must stay byte-identical to the `decision_log` definition in schema.sql
+    -- there is no single source for both because schema.sql runs once
+    against a fresh db via executescript() and this runs against a db that
+    may already exist without ever having seen that script.
+    """
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS decision_log (
@@ -167,7 +173,7 @@ def _ensure_decision_log_table(conn: sqlite3.Connection) -> None:
             run_id       TEXT NOT NULL,
             action       TEXT NOT NULL,
             remedy_kind  TEXT NOT NULL,
-            entity_id    TEXT NOT NULL,
+            entity_id    TEXT NOT NULL REFERENCES entity(id),
             amount_minor INTEGER NOT NULL,
             currency     TEXT NOT NULL,
             decision     TEXT NOT NULL CHECK (decision IN ('approved', 'rejected')),
@@ -179,15 +185,27 @@ def _ensure_decision_log_table(conn: sqlite3.Connection) -> None:
 
 def _log_decision(conn: sqlite3.Connection, run_id: str, remedy, decision: str) -> None:
     """Durable audit record of a treasurer's Approve/Reject click -- a UI
-    toast that vanishes on rerun is not an audit trail."""
+    toast that vanishes on rerun is not an audit trail.
+
+    One row per entity the remedy names, not one row holding the whole
+    comma-joined course -- every other table's `entity_id` column is a
+    single entity, and a column named `entity_id` that sometimes holds
+    "MER-UK, MER-DE, MER-IE" cannot be queried per entity. `amount_minor`
+    and `currency` still describe the whole course's rolled-up USD total
+    (the Remedy doesn't carry a per-entity split), replicated onto each row;
+    only `entity_id` is genuinely per-row here.
+    """
     import datetime as _dt
     _ensure_decision_log_table(conn)
-    conn.execute(
+    decided_at = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    conn.executemany(
         "INSERT INTO decision_log (run_id, action, remedy_kind, entity_id, "
         "amount_minor, currency, decision, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (run_id, remedy.action, remedy.kind, remedy.entity_id,
-         remedy.amount_minor, remedy.currency, decision,
-         _dt.datetime.now(_dt.timezone.utc).isoformat()),
+        [
+            (run_id, remedy.action, remedy.kind, entity_id,
+             remedy.amount_minor, remedy.currency, decision, decided_at)
+            for entity_id in _split_entity_id(remedy.entity_id)
+        ],
     )
     conn.commit()
 
