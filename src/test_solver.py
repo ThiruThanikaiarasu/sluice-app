@@ -3,11 +3,14 @@ and INFEASIBLE with a populated, specific binding_constraints otherwise."""
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from . import baseline, solver
 from .db import horizon_start
-from .models import is_weekend
+from .fx import FXTable
+from .models import HORIZON_DAYS, is_weekend
 from .seed import seed
 
 
@@ -57,6 +60,42 @@ def test_no_transfer_is_sent_or_lands_on_a_weekend(scenario, tmp_path):
     for t in plan.transfers:
         assert not is_weekend(t.send_day, start), t
         assert not is_weekend(t.land_day, start), t
+
+
+def test_build_legs_drops_a_leg_whose_adjusted_land_day_exceeds_the_horizon(tmp_path):
+    """MER-SG -> MER-UK is a 2-day cross-border settlement (DBS -> Barclays,
+    different countries). Sending on day 11 (Friday) raw-lands on day 13
+    (Sunday); business-day-adjusted that pushes to day 14, past
+    HORIZON_DAYS - 1, so _build_legs must drop this leg entirely rather than
+    hand the solver a transfer that can never actually settle."""
+    conn = _conn("base", tmp_path)
+    entities = solver._entities(conn)
+    entity_ids = list(entities.keys())
+    accounts = solver.operating_accounts(conn)
+    ic = solver._ic_agreements(conn)
+    costs = solver._transfer_costs(conn)
+    fx = FXTable(conn)
+    pairs = solver._permitted_pairs(entity_ids, ic)
+    start = horizon_start(conn)
+
+    legs = solver._build_legs(entity_ids, entities, accounts, ic, costs, fx, pairs, start)
+
+    assert ("MER-SG", "MER-UK", 11) not in legs
+    for meta in legs.values():
+        assert meta["land_day"] <= HORIZON_DAYS - 1
+
+
+def test_verify_flags_a_hand_built_transfer_sent_on_a_weekend(tmp_path):
+    conn = _conn("base", tmp_path)
+    plan = solver.solve(conn, "base")
+    assert plan.transfers, "base should always produce at least one real transfer"
+
+    bad_transfer = dataclasses.replace(plan.transfers[0], send_day=5)  # Saturday
+    bad_plan = dataclasses.replace(
+        plan, transfers=(bad_transfer,) + plan.transfers[1:]
+    )
+    violations = solver.verify(conn, bad_plan)
+    assert any("is not a business day" in v for v in violations), violations
 
 
 def test_buffer_penalty_is_charged_once_per_entity_not_per_entity_day(tmp_path):

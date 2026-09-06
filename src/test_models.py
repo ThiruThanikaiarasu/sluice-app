@@ -41,3 +41,11 @@ def test_next_business_day_can_push_past_the_horizon():
     # not this function, which just answers "which day does this actually
     # clear on" with no notion of a horizon boundary.
     assert next_business_day(13, MONDAY) == 14
+
+
+def test_a_friday_send_with_a_two_day_lag_lands_monday_not_sunday():
+    # This is the exact shape _build_legs calls with: send_day (4, Fri) +
+    # settlement_days (2) = a raw land day (6) that is itself a Sunday, not
+    # already a weekend send day like the two cases above.
+    send_day, settlement_days = 4, 2
+    assert next_business_day(send_day + settlement_days, MONDAY) == 7

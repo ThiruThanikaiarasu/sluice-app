@@ -155,16 +155,12 @@ def money(amount_minor: int, currency: str) -> str:
 
 
 def _ensure_decision_log_table(conn: sqlite3.Connection) -> None:
-    """`_ensure_seeded()` only seeds a scenario the first time its db file is
-    created, and that file survives across runs and across branches -- so a
-    db seeded before `decision_log` existed in schema.sql would otherwise
-    make every write/read here raise `no such table`. Same fix metrics.py
-    already uses for `run_metrics`.
-
-    Must stay byte-identical to the `decision_log` definition in schema.sql
-    -- there is no single source for both because schema.sql runs once
-    against a fresh db via executescript() and this runs against a db that
-    may already exist without ever having seen that script.
+    """The one and only definition of `decision_log` -- deliberately absent
+    from schema.sql (see the comment there). `_ensure_seeded()` only seeds a
+    scenario the first time its db file is created, and that file survives
+    across runs and across branches, so this must run before every write or
+    read rather than assuming the table is already there. Same precedent
+    metrics.py already set for `run_metrics`.
     """
     conn.execute(
         """
