@@ -95,3 +95,23 @@ CREATE TABLE meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- A real committed revolving facility an entity can draw against when the
+-- solver comes back infeasible. Named, limited and priced -- so the
+-- "draw on the revolver" remedy points at an actual instrument instead of a
+-- placeholder string.
+CREATE TABLE revolver_facility (
+    entity_id   TEXT PRIMARY KEY REFERENCES entity(id),
+    lender      TEXT NOT NULL,
+    limit_minor INTEGER NOT NULL,   -- undrawn committed limit, entity's own currency
+    currency    TEXT NOT NULL,
+    rate_bps    INTEGER NOT NULL,   -- annual, basis points, charged only while drawn
+    source_doc  TEXT
+);
+
+-- decision_log is deliberately not defined here. Unlike revolver_facility
+-- (which needs real seeded rows), it starts empty either way, so it has
+-- exactly one definition -- app.py's _ensure_decision_log_table(), created
+-- lazily on first write or read, the same precedent metrics.py already set
+-- for run_metrics. Defining it here too would be a second definition that
+-- has to stay byte-compatible with the first forever.

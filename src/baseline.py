@@ -13,8 +13,9 @@ from __future__ import annotations
 import sqlite3
 import time
 
+from .db import horizon_start
 from .fx import FXTable
-from .models import HORIZON_DAYS
+from .models import HORIZON_DAYS, next_business_day
 from .positions import binding_floors, opening_balances, shortfalls
 from .solver import (
     Plan,
@@ -45,6 +46,7 @@ def naive_plan(conn: sqlite3.Connection, scenario: str) -> Plan:
     ic = _ic_agreements(conn)
     costs = _transfer_costs(conn)
     fx = FXTable(conn)
+    hstart = horizon_start(conn)
 
     from_bank = accounts[FUNDER][1]
     ci = entities[FUNDER]
@@ -74,8 +76,12 @@ def naive_plan(conn: sqlite3.Connection, scenario: str) -> Plan:
         if amount_minor <= 0:
             continue
 
-        send_day = 0
-        land_day = send_day + settlement_days
+        # Wires are not initiated or landed on a non-business day -- same
+        # rule the solver applies in _build_legs, so the naive baseline's
+        # cost is genuinely comparable rather than quietly cheaper because
+        # it assumed a weekend settlement the real solver would never take.
+        send_day = next_business_day(0, hstart)
+        land_day = next_business_day(send_day + settlement_days, hstart)
         if land_day > HORIZON_DAYS - 1:
             continue
 

@@ -24,8 +24,9 @@ from dataclasses import dataclass
 
 import pulp
 
+from .db import horizon_start
 from .fx import FXTable
-from .models import HORIZON_DAYS, to_major
+from .models import HORIZON_DAYS, is_weekend, next_business_day, to_major
 from .positions import binding_floors, opening_balances
 
 # Safe upper bound on any single transfer leg, in minor units of the sending
@@ -35,6 +36,22 @@ BIG_M = 2_000_000_000
 # Weight that forces the elastic solve to eliminate shortfall before it cares
 # about real transfer cost at all.
 PENALTY = 10**9
+
+# Target headroom above each covenant/policy floor, and the small notional
+# cost charged once per entity (not once per entity-day -- a single shared
+# slack variable covers that entity's worst day across the whole horizon,
+# and only that one charge enters the objective) when a plan doesn't reach
+# it anywhere. At BUFFER_PENALTY_BPS/10_000 = 0.05%, this is deliberately
+# the same order of magnitude as a single leg's one-time FX spread charge
+# (8-12bps seeded); charging it per day instead would compound to ~10x a
+# real leg's spread over a 14-day horizon and stop being a tie-break -- the
+# solver would pay genuine FX/fee cost chasing a notional buffer target.
+# Soft either way: a plan can still park exactly on the floor when cash is
+# genuinely too scarce to do better, but it now costs something in the
+# objective rather than being free, so the solver stops choosing zero
+# headroom by indifference.
+BUFFER_BPS = 500
+BUFFER_PENALTY_BPS = 5
 
 
 @dataclass(frozen=True)
@@ -278,8 +295,12 @@ def project_balances(
 # The solve
 # --------------------------------------------------------------------------
 
-def _build_legs(entity_ids, entities, accounts, ic, costs, fx, pairs):
-    """Static per-(i,j,d) metadata: land_day, fee, FX quote, ic rate."""
+def _build_legs(entity_ids, entities, accounts, ic, costs, fx, pairs, start):
+    """Static per-(i,j,d) metadata: land_day, fee, FX quote, ic rate.
+
+    `land_day` is business-day-adjusted: a wire never actually clears on a
+    Saturday or Sunday, whatever the raw settlement_days lag arithmetic says.
+    """
     legs = {}
     for (i, j) in pairs:
         from_bank = accounts[i][1]
@@ -288,7 +309,9 @@ def _build_legs(entity_ids, entities, accounts, ic, costs, fx, pairs):
         rate = fx.rate(entities[i], entities[j])
         rate_bps = ic[(i, j)]["rate_bps"]
         for d in range(HORIZON_DAYS):
-            land_day = d + settlement_days
+            if is_weekend(d, start):
+                continue  # wires are not initiated on a non-business day
+            land_day = next_business_day(d + settlement_days, start)
             if land_day > HORIZON_DAYS - 1:
                 continue
             legs[(i, j, d)] = {
@@ -346,9 +369,10 @@ def solve(conn: sqlite3.Connection, scenario: str) -> Plan:
     ic = _ic_agreements(conn)
     costs = _transfer_costs(conn)
     fx = FXTable(conn)
+    hstart = horizon_start(conn)
 
     pairs = _permitted_pairs(entity_ids, ic)
-    legs = _build_legs(entity_ids, entities, accounts, ic, costs, fx, pairs)
+    legs = _build_legs(entity_ids, entities, accounts, ic, costs, fx, pairs, hstart)
     lag_min = {e: earliest_actionable_day(e, entity_ids, accounts, ic, costs) for e in entity_ids}
 
     usd_rate = {c: fx.rate(c, "USD").effective for c in set(entities.values())}
@@ -372,10 +396,22 @@ def solve(conn: sqlite3.Connection, scenario: str) -> Plan:
         interest_coef = (meta["rate_bps"] / 10_000) * (days_out / 365) * usd_rate[ci]
         objective_terms.append(x[key] * (fx_coef + interest_coef))
         objective_terms.append(y[key] * meta["fee_usd"])
-    prob += pulp.lpSum(objective_terms)
 
     balance_expr = {e: {} for e in entity_ids}
     for e in entity_ids:
+        ce = entities[e]
+        buffer_target = floors.get(e, 0) + round(floors.get(e, 0) * BUFFER_BPS / 10_000)
+        # Soft preference, not a constraint: a plan that parks a balance
+        # exactly on its floor with zero headroom is legal but not something
+        # a treasurer should have to sign off on unless cash is genuinely too
+        # scarce to do better. One slack variable per entity -- not one per
+        # entity-day -- covers that entity's worst day across the whole
+        # horizon (every day's constraint below shares it, so the LP must
+        # size it to the largest gap), but it is only charged once in the
+        # objective. Charging it per day instead would compound a persisting
+        # gap into a cost many times larger than the real spread of actually
+        # moving cash to close it, which stops being a tie-break.
+        buffer_slack = pulp.LpVariable(f"buffer_slack_{e}", lowBound=0)
         cum_flow = 0
         for d in range(HORIZON_DAYS):
             cum_flow += flows.get(e, {}).get(d, 0)
@@ -390,6 +426,14 @@ def solve(conn: sqlite3.Connection, scenario: str) -> Plan:
             if d >= lag_min[e]:
                 prob += expr >= floors.get(e, 0), f"floor_{e}_{d}"
                 prob += expr >= 0, f"nonneg_{e}_{d}"
+                prob += expr + buffer_slack >= buffer_target, f"buffer_{e}_{d}"
+        # Charged once per entity here, after the day loop, regardless of how
+        # many (or zero) days actually constrained buffer_slack above.
+        objective_terms.append(
+            buffer_slack * (BUFFER_PENALTY_BPS / 10_000) * usd_rate[ce]
+        )
+
+    prob += pulp.lpSum(objective_terms)
 
     for (i, j) in pairs:
         total_lent = pulp.lpSum(x[key] for key in x if key[0] == i and key[1] == j)
@@ -589,8 +633,11 @@ def verify(conn: sqlite3.Connection, plan: Plan) -> list[str]:
     costs = _transfer_costs(conn)
     accounts = operating_accounts(conn)
     lag_min = {e: earliest_actionable_day(e, entity_ids, accounts, ic, costs) for e in entity_ids}
+    start = horizon_start(conn)
+    fx = FXTable(conn)
 
     ic_cumulative: dict[tuple[str, str], int] = {}
+    recomputed_total = 0
 
     for t in plan.transfers:
         if t.amount_minor <= 0:
@@ -601,6 +648,11 @@ def verify(conn: sqlite3.Connection, plan: Plan) -> list[str]:
         if not (0 <= t.send_day < HORIZON_DAYS):
             violations.append(
                 f"transfer {t.from_entity}->{t.to_entity}: send_day {t.send_day} out of horizon"
+            )
+        elif is_weekend(t.send_day, start):
+            violations.append(
+                f"transfer {t.from_entity}->{t.to_entity}: send_day {t.send_day} "
+                "is not a business day"
             )
 
         from_acc = account_by_id.get(t.from_account)
@@ -621,12 +673,35 @@ def verify(conn: sqlite3.Connection, plan: Plan) -> list[str]:
             fee, settle = costs.get((from_acc[1], to_acc[1]), (None, None))
             if settle is None:
                 violations.append(f"no transfer_cost row for {from_acc[1]}->{to_acc[1]}")
-            elif t.land_day != t.send_day + settle:
-                violations.append(
-                    f"transfer {t.from_entity}->{t.to_entity} day {t.send_day}: "
-                    f"land_day {t.land_day} != send_day + settlement_days "
-                    f"({t.send_day + settle})"
+            else:
+                expected_land = next_business_day(t.send_day + settle, start)
+                if t.land_day != expected_land:
+                    violations.append(
+                        f"transfer {t.from_entity}->{t.to_entity} day {t.send_day}: "
+                        f"land_day {t.land_day} != business-day-adjusted "
+                        f"send_day + settlement_days ({expected_land})"
+                    )
+
+        if from_acc is not None and to_acc is not None:
+            rate_bps = ic.get((t.from_entity, t.to_entity), {}).get("rate_bps")
+            fee_usd, _ = costs.get((from_acc[1], to_acc[1]), (0, 0))
+            if rate_bps is not None:
+                landed, fx_cost, fee, interest = leg_cost(
+                    t.amount_minor, entities[t.from_entity], entities[t.to_entity],
+                    rate_bps, t.land_day, fee_usd, fx,
                 )
+                if landed != t.landed_minor:
+                    violations.append(
+                        f"transfer {t.from_entity}->{t.to_entity} day {t.send_day}: "
+                        f"landed_minor {t.landed_minor} != recomputed {landed}"
+                    )
+                if (fx_cost, fee, interest) != (t.fx_cost_minor, t.fee_minor, t.interest_minor):
+                    violations.append(
+                        f"transfer {t.from_entity}->{t.to_entity} day {t.send_day}: "
+                        f"cost (fx={t.fx_cost_minor}, fee={t.fee_minor}, interest={t.interest_minor}) "
+                        f"!= recomputed (fx={fx_cost}, fee={fee}, interest={interest})"
+                    )
+                recomputed_total += fx_cost + fee + interest
 
         key = (t.from_entity, t.to_entity)
         ic_cumulative[key] = ic_cumulative.get(key, 0) + t.amount_minor
@@ -638,6 +713,12 @@ def verify(conn: sqlite3.Connection, plan: Plan) -> list[str]:
                 f"IC exposure {lender}->{borrower} totals {total} minor units, "
                 f"exceeds max_limit {limit}"
             )
+
+    if recomputed_total != plan.total_cost_minor:
+        violations.append(
+            f"plan.total_cost_minor {plan.total_cost_minor} != recomputed "
+            f"{recomputed_total} (sum of independently-recomputed per-leg fx+fee+interest)"
+        )
 
     balances = project_balances(entity_ids, opening, flows, plan.transfers)
     for e in entity_ids:

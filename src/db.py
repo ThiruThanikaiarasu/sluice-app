@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import date
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -31,3 +32,10 @@ def init_db(db_path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
 def scenario_of(conn: sqlite3.Connection) -> str | None:
     row = conn.execute("SELECT value FROM meta WHERE key = 'scenario'").fetchone()
     return row["value"] if row else None
+
+
+def horizon_start(conn: sqlite3.Connection) -> date:
+    row = conn.execute("SELECT value FROM meta WHERE key = 'horizon_start'").fetchone()
+    if row is None:
+        raise RuntimeError("meta.horizon_start not set -- was this db seeded?")
+    return date.fromisoformat(row["value"])
