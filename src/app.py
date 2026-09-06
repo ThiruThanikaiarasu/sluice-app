@@ -331,8 +331,16 @@ def render_plan(data: dict) -> None:
     } for t in plan.transfers]
     st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
-    fx_cost = sum(t.fx_cost_minor for t in plan.transfers)
-    fee_cost = sum(t.fee_minor for t in plan.transfers)
+    # Repayment legs carry their own real FX/fee cost (the borrower
+    # converting back to the lender's currency), already folded into
+    # plan.total_cost_minor -- fold it into these two lines too, or they
+    # stop summing to the Total tile on any plan with a repayment.
+    fx_cost = sum(t.fx_cost_minor for t in plan.transfers) + sum(
+        r.fx_cost_minor for r in plan.repayments
+    )
+    fee_cost = sum(t.fee_minor for t in plan.transfers) + sum(
+        r.fee_minor for r in plan.repayments
+    )
     interest_cost = sum(t.interest_minor for t in plan.transfers)
 
     st.markdown("**Cost**")
@@ -356,7 +364,7 @@ def render_plan(data: dict) -> None:
         # fees are the only lines that leave the group. Report both so a
         # treasurer can see which number is the group's actual saving.
         naive_fx_fee = sum(t.fx_cost_minor + t.fee_minor for t in naive.transfers)
-        plan_fx_fee = sum(t.fx_cost_minor + t.fee_minor for t in plan.transfers)
+        plan_fx_fee = fx_cost + fee_cost
         group_delta = naive_fx_fee - plan_fx_fee
         st.markdown("**Group-consolidated saving (excludes intercompany interest)**")
         st.metric("Real cash saved (FX + fees only)", money(group_delta, "USD"))

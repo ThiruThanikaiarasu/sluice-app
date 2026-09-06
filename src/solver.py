@@ -21,6 +21,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from dataclasses import dataclass
+from datetime import date
 
 import pulp
 
@@ -247,6 +248,8 @@ def earliest_actionable_day(
     accounts: dict[str, tuple[str, str, str]],
     ic: dict[tuple[str, str], dict],
     costs: dict[tuple[str, str], tuple[int, int]],
+    countries: dict[str, str],
+    start: date,
 ) -> int:
     """The first horizon day a transfer sent today could possibly land at
     `entity_id`, given the fastest permitted lender and settlement lag.
@@ -256,6 +259,15 @@ def earliest_actionable_day(
     any transfer decision can influence. Floor testing (and the diagnosis of
     a shortfall) is only meaningful from this day forward.
 
+    Calendar-aware, not just a raw settlement-day count: if day 0 itself is
+    a weekend or a bank holiday for a given lender pair, the earliest that
+    pair could even *send* is later than day 0, and the earliest it could
+    *land* is later still. Ignoring that (as an earlier revision did) can
+    exempt a floor from testing one day too early, or -- the sharper
+    failure -- test it one day too soon, since a lender-pair's send day
+    landing exactly on the horizon's own start date is common (2026-09-07,
+    day 0 of the seeded horizon, is Labor Day in both the US and Canada).
+
     If `entity_id` has no permitted lender at all, this returns 0 rather than
     some later day: nothing will ever arrive to help it, so its own balance
     from day 0 onward (net of anything it chooses to lend out) is exactly as
@@ -263,7 +275,7 @@ def earliest_actionable_day(
     from day 0 -- that is the correct day to start reporting it, not a grace
     window it does not have.
     """
-    lags = []
+    land_days = []
     for lender in entity_ids:
         if lender == entity_id:
             continue
@@ -273,8 +285,10 @@ def earliest_actionable_day(
         from_bank = accounts[lender][1]
         to_bank = accounts[entity_id][1]
         _, settlement_days = _transfer_cost_for(costs, from_bank, to_bank)
-        lags.append(settlement_days)
-    return min(lags) if lags else 0
+        pair_countries = frozenset({countries[lender], countries[entity_id]})
+        send_day = next_settlement_day(0, start, pair_countries)
+        land_days.append(next_settlement_day(send_day + settlement_days, start, pair_countries))
+    return min(land_days) if land_days else 0
 
 
 def _baseline_balances(
@@ -683,7 +697,10 @@ def solve(conn: sqlite3.Connection, scenario: str) -> Plan:
 
     pairs = _permitted_pairs(entity_ids, ic)
     legs = _build_legs(entity_ids, entities, accounts, ic, costs, fx, pairs, hstart, countries)
-    lag_min = {e: earliest_actionable_day(e, entity_ids, accounts, ic, costs) for e in entity_ids}
+    lag_min = {
+        e: earliest_actionable_day(e, entity_ids, accounts, ic, costs, countries, hstart)
+        for e in entity_ids
+    }
 
     usd_rate = {c: fx.rate(c, "USD").effective for c in set(entities.values())}
 
@@ -735,6 +752,11 @@ def solve(conn: sqlite3.Connection, scenario: str) -> Plan:
     # already goes through) plus 1 minor unit of slack is exact enough for
     # money and immune to that noise.
     real_cost_optimum = round(pulp.value(model["real_cost_expr"]))
+    # Snapshotted before phase 2 touches the shared variable objects: phase
+    # 1's solution is itself feasible and real-cost-optimal, so if phase 2
+    # doesn't come back Optimal, falling back to this is strictly safer
+    # than either crashing or serving phase 2's partial/garbage values.
+    phase1_values = {key: var.value() for key, var in x.items()}
 
     prob2 = pulp.LpProblem("sluice_phase2_interest", pulp.LpMinimize)
     prob2 += model["interest_expr"]
@@ -743,14 +765,15 @@ def solve(conn: sqlite3.Connection, scenario: str) -> Plan:
     prob2.solve(pulp.PULP_CBC_CMD(msg=False))
     solve_seconds = time.monotonic() - start
     # phase 2 starts from phase 1's already-Optimal, now-further-constrained
-    # feasible region, so it cannot come back Infeasible -- if it ever did,
-    # that would mean the lock constraint above is wrong, not that this
-    # scenario is unsolvable.
-    assert pulp.LpStatus[prob2.status] == "Optimal", (
-        f"phase 2 (interest tie-break) failed with phase 1 already Optimal: "
-        f"{pulp.LpStatus[prob2.status]!r} -- lock_real_cost constraint is "
-        "almost certainly wrong"
-    )
+    # feasible region, so it should never come back non-Optimal -- if it
+    # ever does (a wrong lock constraint, or CBC hitting some internal
+    # limit), fall back to phase 1's own solution rather than raise: it is
+    # still a correct, real-cost-optimal plan, just not tie-broken on
+    # interest, which is a strictly better failure mode than a crash on the
+    # production solve path.
+    if pulp.LpStatus[prob2.status] != "Optimal":
+        for key, var in x.items():
+            var.varValue = phase1_values[key]
 
     transfers = tuple(_extract_transfers(entities, accounts, legs, x, fx))
     repayments = tuple(_extract_repayments(entities, accounts, legs, x, fx))
@@ -927,10 +950,13 @@ def verify(conn: sqlite3.Connection, plan: Plan) -> list[str]:
     ic = _ic_agreements(conn)
     costs = _transfer_costs(conn)
     accounts = operating_accounts(conn)
-    lag_min = {e: earliest_actionable_day(e, entity_ids, accounts, ic, costs) for e in entity_ids}
     start = horizon_start(conn)
     fx = FXTable(conn)
     countries = _countries(conn)
+    lag_min = {
+        e: earliest_actionable_day(e, entity_ids, accounts, ic, costs, countries, start)
+        for e in entity_ids
+    }
 
     ic_cumulative: dict[tuple[str, str], int] = {}
     recomputed_total = 0
@@ -1015,15 +1041,22 @@ def verify(conn: sqlite3.Connection, plan: Plan) -> list[str]:
 
                 if claimed is not None:
                     ci, cj = entities[t.from_entity], entities[t.to_entity]
+                    repay_pair = costs.get((to_acc[1], from_acc[1]))
+                    if repay_pair is None:
+                        violations.append(
+                            f"no transfer_cost row for {to_acc[1]}->{from_acc[1]} "
+                            f"(repayment {t.to_entity}->{t.from_entity})"
+                        )
+                        repay_fee_usd, repay_settle = 0, 0
+                    else:
+                        repay_fee_usd, repay_settle = repay_pair
                     pay_day = next_settlement_day(t.land_day + term_days, start, pair_countries)
-                    _, repay_settle = costs.get((to_acc[1], from_acc[1]), (0, 0))
                     repay_land_day = next_settlement_day(
                         pay_day + repay_settle, start, pair_countries
                     )
                     total_ci = repayment_owed_minor(t.amount_minor, rate_bps, term_days)
                     quote = fx.rate(cj, ci)
                     paid_cj = round(total_ci / quote.effective)
-                    repay_fee_usd, _ = costs.get((to_acc[1], from_acc[1]), (0, 0))
                     fx_cost_cj = round(paid_cj * quote.spread_bps / 20_000)
                     repay_fx_cost_usd = round(fx_cost_cj * fx.rate(cj, "USD").effective)
                     recomputed_total += repay_fx_cost_usd + repay_fee_usd

@@ -132,7 +132,10 @@ def naive_plan(conn: sqlite3.Connection, scenario: str) -> Plan:
     transfers.sort(key=lambda t: (t.send_day, t.from_entity, t.to_entity))
     closing_balances = project_balances(entity_ids, opening, flows, tuple(transfers))
 
-    lag_min = {e: earliest_actionable_day(e, entity_ids, accounts, ic, costs) for e in entity_ids}
+    lag_min = {
+        e: earliest_actionable_day(e, entity_ids, accounts, ic, costs, countries, hstart)
+        for e in entity_ids
+    }
     breach = False
     binding: list[str] = []
     for e in entity_ids:

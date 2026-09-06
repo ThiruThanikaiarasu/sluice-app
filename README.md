@@ -93,11 +93,15 @@ It does not re-run the solver itself, so it cannot prove the plan is
   and starts being a second objective the solver optimises against.
 - The solver is a MILP with one binary leg-activation variable per
   (entity-pair, day): ~300 binaries at 6 entities over the 14-day horizon,
-  solved by CBC in ~6s. That does not linearly extend to the ~10 banks the
-  pitch describes — 20 entities is roughly 5,300 binaries, well past where
-  CBC solves comfortably in a demo. Scaling past this would mean decomposing
-  by entity cluster, warm-starting from the previous day's plan, or moving
-  to a commercial MILP solver; none of that is implemented yet.
+  solved by CBC in well under a second to a few seconds depending on
+  scenario (see the solve times in the results table below — two solves
+  now, not one, per the lexicographic split above). That does not linearly
+  extend to the ~10 banks the pitch describes — 20 entities is roughly
+  5,300 binaries, well past where CBC solves comfortably in a demo, and the
+  two-solve split makes that ceiling closer, not further. Scaling past this
+  would mean decomposing by entity cluster, warm-starting from the previous
+  day's plan, or moving to a commercial MILP solver; none of that is
+  implemented yet.
 - Every intercompany loan now has a real maturity (`ic_agreement.term_days`,
   a single disclosed 7-day assumption for every pair -- there is no
   per-pair contractual term in the seed data to draw a more granular number

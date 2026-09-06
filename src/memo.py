@@ -137,9 +137,23 @@ def _ic_repaid(conn: sqlite3.Connection, plan: Plan) -> list[dict]:
 
 
 def _cost_breakdown(plan: Plan) -> dict[str, int]:
+    """FX/fee/interest lines that must sum to `plan.total_cost_minor`.
+
+    `total_cost_minor` includes each repayment leg's own fx_cost_minor and
+    fee_minor (a real conversion cost, borne when the borrower converts
+    back to the lender's currency to repay) -- fold those into the same
+    two lines here, not just the forward draws, or this breakdown quietly
+    stops reconciling to the total on any plan with a repayment.
+    """
     return {
-        "fx_cost_minor": sum(t.fx_cost_minor for t in plan.transfers),
-        "fee_minor": sum(t.fee_minor for t in plan.transfers),
+        "fx_cost_minor": (
+            sum(t.fx_cost_minor for t in plan.transfers)
+            + sum(r.fx_cost_minor for r in plan.repayments)
+        ),
+        "fee_minor": (
+            sum(t.fee_minor for t in plan.transfers)
+            + sum(r.fee_minor for r in plan.repayments)
+        ),
         "interest_minor": sum(t.interest_minor for t in plan.transfers),
         "total_minor": plan.total_cost_minor,
     }
