@@ -95,3 +95,31 @@ CREATE TABLE meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- A real committed revolving facility an entity can draw against when the
+-- solver comes back infeasible. Named, limited and priced -- so the
+-- "draw on the revolver" remedy points at an actual instrument instead of a
+-- placeholder string.
+CREATE TABLE revolver_facility (
+    entity_id   TEXT PRIMARY KEY REFERENCES entity(id),
+    lender      TEXT NOT NULL,
+    limit_minor INTEGER NOT NULL,   -- undrawn committed limit, entity's own currency
+    currency    TEXT NOT NULL,
+    rate_bps    INTEGER NOT NULL,   -- annual, basis points, charged only while drawn
+    source_doc  TEXT
+);
+
+-- Every Approve/Reject decision a treasurer makes in the UI, so an approved
+-- remedy leaves a durable record instead of a toast that disappears on
+-- rerun.
+CREATE TABLE decision_log (
+    id           INTEGER PRIMARY KEY,
+    run_id       TEXT NOT NULL,
+    action       TEXT NOT NULL,
+    remedy_kind  TEXT NOT NULL,
+    entity_id    TEXT NOT NULL,
+    amount_minor INTEGER NOT NULL,
+    currency     TEXT NOT NULL,
+    decision     TEXT NOT NULL CHECK (decision IN ('approved', 'rejected')),
+    decided_at   TEXT NOT NULL
+);

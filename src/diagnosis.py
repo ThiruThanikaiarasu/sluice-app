@@ -120,6 +120,15 @@ def _entity_covenant(conn: sqlite3.Connection, entity_id: str) -> dict | None:
     return dict(rows) if rows else None
 
 
+def _revolver_facility(conn: sqlite3.Connection, entity_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT entity_id, lender, limit_minor, currency, rate_bps, source_doc "
+        "FROM revolver_facility WHERE entity_id = ?",
+        (entity_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
 def _payable_candidate(conn: sqlite3.Connection, entity_id: str) -> dict | None:
     """A negative one-off cash_forecast entry for this entity that reads as a
     genuine, delayable commercial payable -- not a tax, statutory or payroll
@@ -163,22 +172,40 @@ def _build_revolver_remedy(
     if not shortfalls:
         return None
 
+    # Only offered against a real, named facility with enough committed
+    # limit to matter -- never the same instrument the covenant itself
+    # measures (revolver_facility is always a different bank/agreement than
+    # the covenant's facility in the seed data).
+    covered: list[Shortfall] = []
     per_entity = []
     total_usd_minor = 0
     for sf in shortfalls:
-        covenant = _entity_covenant(conn, sf.entity_id)
-        facility = "committed revolving facility"
-        if covenant and covenant["kind"] == "overdraft_facility_minimum":
-            facility = "group revolving credit facility (not the overdraft " \
-                       "line the covenant itself measures)"
-        per_entity.append(
-            f"{sf.entity_id} draws {to_major(sf.amount_minor)} {sf.currency} "
-            f"on its {facility}"
+        facility = _revolver_facility(conn, sf.entity_id)
+        if not facility or facility["currency"] != sf.currency:
+            continue
+        draw = min(sf.amount_minor, facility["limit_minor"])
+        if draw <= 0:
+            continue
+        short_note = (
+            f" (covers {to_major(draw)} of the {to_major(sf.amount_minor)} "
+            f"shortfall against a {to_major(facility['limit_minor'])} "
+            f"{facility['currency']} committed limit -- the rest needs "
+            "another lever)"
+            if draw < sf.amount_minor else ""
         )
-        total_usd_minor += _usd_minor(conn, sf.amount_minor, sf.currency)
+        per_entity.append(
+            f"{sf.entity_id} draws {to_major(draw)} {facility['currency']} on its "
+            f"{facility['lender']} revolver at {facility['rate_bps'] / 100:.2f}% p.a. "
+            f"({facility['source_doc']}){short_note}"
+        )
+        covered.append(sf)
+        total_usd_minor += _usd_minor(conn, draw, facility["currency"])
 
-    entity_id = _join_entity_ids([sf.entity_id for sf in shortfalls])
-    lines = "; ".join(sf.line for sf in shortfalls)
+    if not covered:
+        return None
+
+    entity_id = _join_entity_ids([sf.entity_id for sf in covered])
+    lines = "; ".join(sf.line for sf in covered)
     return Remedy(
         action=f"Draw on revolving facilities at {entity_id}",
         kind=REVOLVER,
@@ -193,8 +220,8 @@ def _build_revolver_remedy(
         requires_signoff=None,
         rank=0,
         rationale=(
-            "Cheapest and fully reversible option, assuming each entity's "
-            f"facility has undrawn headroom to cover its shortfall. Against: {lines}"
+            "Cheapest and fully reversible option, against each entity's own "
+            f"named, committed facility. Against: {lines}"
         ),
     )
 

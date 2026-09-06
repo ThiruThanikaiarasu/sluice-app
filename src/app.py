@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from dotenv import load_dotenv
 
 # `streamlit run src/app.py` executes this file as a script with no package
 # context, so relative imports fail. Put the repo root on sys.path and import
@@ -22,9 +23,19 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from src import baseline, metrics, positions as positions_mod, seed, solver, theme, tracing
+# Must run before any src.llm.complete() call anywhere in the process, or the
+# demo silently falls back to whatever happens to already be in os.environ.
+load_dotenv(_REPO_ROOT / ".env")
+
+from src import baseline, metrics, positions as positions_mod, seed, solver, theme
 from src.db import REPO_ROOT
-from src.diagnosis import diagnose, record_override
+from src.diagnosis import (
+    DELAY_PAYABLE,
+    REVOLVER,
+    SOFT_COVENANT,
+    diagnose,
+    record_override,
+)
 from src.memo import write_escalation, write_memo
 from src.models import format_money
 from src.seed import SCENARIOS
@@ -34,9 +45,13 @@ from src.seed import SCENARIOS
 # -- this degrades to plain untraced calls rather than crashing the app, since
 # a trace key is an operator convenience, not a correctness requirement.
 try:
+    from src import tracing
     tracing.init()
     HAS_TRACING = True
 except Exception:
+    # Missing/invalid NEATLOGS_API_KEY, or the package isn't installed --
+    # tracing is an observability nice-to-have, never a reason to break the
+    # demo screen.
     HAS_TRACING = False
 
 DB_DIR = REPO_ROOT / "data" / "app"
@@ -82,6 +97,7 @@ def solve_scenario(scenario: str):
         opening = positions_mod.opening_balances(conn)
         run_metrics = metrics.measure(conn, plan, naive)
         metrics.persist(conn, run_metrics)
+        history = metrics.history(conn, scenario)
     finally:
         conn.close()
     return {
@@ -91,6 +107,7 @@ def solve_scenario(scenario: str):
         "summary": summary,
         "opening": opening,
         "metrics": run_metrics,
+        "history": history,
     }
 
 
@@ -136,10 +153,34 @@ def money(amount_minor: int, currency: str) -> str:
     return format_money(amount_minor, currency)
 
 
+def _log_decision(conn: sqlite3.Connection, run_id: str, remedy, decision: str) -> None:
+    """Durable audit record of a treasurer's Approve/Reject click -- a UI
+    toast that vanishes on rerun is not an audit trail."""
+    import datetime as _dt
+    conn.execute(
+        "INSERT INTO decision_log (run_id, action, remedy_kind, entity_id, "
+        "amount_minor, currency, decision, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (run_id, remedy.action, remedy.kind, remedy.entity_id,
+         remedy.amount_minor, remedy.currency, decision,
+         _dt.datetime.now(_dt.timezone.utc).isoformat()),
+    )
+    conn.commit()
+
+
+def approve_remedy(scenario: str, remedy, run_id: str) -> None:
+    conn = _connect(scenario)
+    conn.row_factory = sqlite3.Row
+    try:
+        _log_decision(conn, run_id, remedy, "approved")
+    finally:
+        conn.close()
+
+
 def reject_remedy(scenario: str, remedy, reason: str, run_id: str) -> None:
     conn = _connect(scenario)
     conn.row_factory = sqlite3.Row
     try:
+        _log_decision(conn, run_id, remedy, "rejected")
         if HAS_TRACING:
             tracing.traced_record_override(
                 lambda: record_override(conn, remedy, reason, run_id),
@@ -151,6 +192,18 @@ def reject_remedy(scenario: str, remedy, reason: str, run_id: str) -> None:
     finally:
         conn.close()
     st.session_state[f"version:{scenario}"] = st.session_state.get(f"version:{scenario}", 0) + 1
+
+
+def decision_history(scenario: str) -> list[dict]:
+    conn = _connect(scenario)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT * FROM decision_log ORDER BY id"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 
 def render_positions(data: dict) -> None:
@@ -221,6 +274,21 @@ def render_plan(data: dict) -> None:
         c1, c2 = st.columns(2)
         c1.metric("Saved", money(delta, "USD"))
         c2.metric("Saved %", f"{pct:.1f}%")
+
+        # Intercompany interest is an intra-group transfer: it nets to zero on
+        # consolidation, so it is not a real cost saving to the group even
+        # though it is a real cost to the paying entity. FX spread and wire
+        # fees are the only lines that leave the group. Report both so a
+        # treasurer can see which number is the group's actual saving.
+        naive_fx_fee = sum(t.fx_cost_minor + t.fee_minor for t in naive.transfers)
+        plan_fx_fee = sum(t.fx_cost_minor + t.fee_minor for t in plan.transfers)
+        group_delta = naive_fx_fee - plan_fx_fee
+        st.markdown("**Group-consolidated saving (excludes intercompany interest)**")
+        st.metric("Real cash saved (FX + fees only)", money(group_delta, "USD"))
+        st.caption(
+            "Intercompany interest is excluded here: it is a real cost to the "
+            "paying entity but nets to zero on group consolidation."
+        )
     else:
         st.caption("Naive baseline is itself infeasible for this scenario -- no comparable cost.")
 
@@ -258,12 +326,29 @@ def render_escalation(scenario: str, data: dict) -> None:
     st.write(diag.explanation)
     st.metric("Shortfall", money(diag.shortfall_minor, "USD"))
 
+    # diagnose() already consolidates candidates to one Remedy per kind
+    # (revolver / soft-covenant / delayed-payable), each naming every entity
+    # it covers -- so this renders each course of action once, not per
+    # entity. Approving or rejecting acts on the whole course; rejecting
+    # excludes every entity it names from that kind on the next diagnosis
+    # (see record_override's docstring in diagnosis.py).
+    kind_label = {
+        REVOLVER: "Revolver draws",
+        SOFT_COVENANT: "Soft covenant breaches",
+        DELAY_PAYABLE: "Delayed payables",
+    }
     st.markdown("**Ranked remedies**")
     for remedy in diag.remedies:
+        entity_count = len(remedy.entity_id.split(", "))
         with st.container(border=True):
-            st.markdown(f"**#{remedy.rank} -- {remedy.action}**")
-            st.write(f"{remedy.entity_id} · {money(remedy.amount_minor, remedy.currency)} · "
-                     f"{remedy.kind} · {'reversible' if remedy.reversible else 'not reversible'}")
+            st.markdown(
+                f"**#{remedy.rank} -- {kind_label.get(remedy.kind, remedy.kind)}: "
+                f"{remedy.action}**"
+            )
+            st.write(f"{remedy.entity_id} ({entity_count} "
+                     f"entit{'y' if entity_count == 1 else 'ies'}) · "
+                     f"{money(remedy.amount_minor, remedy.currency)} · "
+                     f"{'reversible' if remedy.reversible else 'not reversible'}")
             st.write(remedy.business_cost)
             st.caption(remedy.rationale)
             if remedy.requires_signoff:
@@ -272,13 +357,19 @@ def render_escalation(scenario: str, data: dict) -> None:
             key_base = f"{scenario}:{remedy.rank}:{remedy.action}"
             c1, c2 = st.columns(2)
             if c1.button("Approve", key=f"approve:{key_base}"):
-                st.success(f"Approved: {remedy.action}")
+                approve_remedy(scenario, remedy, run_id)
+                st.success(f"Approved and logged: {remedy.action}")
             if c2.button("Reject", key=f"reject:{key_base}"):
                 reject_remedy(scenario, remedy, f"rejected via UI: {remedy.action}", run_id)
                 st.rerun()
 
     st.markdown(f"**Recommendation:** {diag.recommendation}")
     st.caption(f"Escalate to: {diag.escalate_to}")
+
+    history = decision_history(scenario)
+    if history:
+        with st.expander(f"Decision audit log ({len(history)} recorded)"):
+            st.dataframe(pd.DataFrame(history), hide_index=True, use_container_width=True)
 
     st.markdown("---")
     st.markdown("**Escalation memo**")
@@ -300,7 +391,13 @@ def render_metrics(data: dict) -> None:
 
     c1, c2, c3, c4 = st.columns(4)
 
-    if violations:
+    if not plan.feasible:
+        # verify() returns [] for an INFEASIBLE plan by construction (there
+        # are no transfers to check) -- that is not the same claim as "zero
+        # constraint violations on a real plan", so do not render it as one.
+        c1.metric("Constraint violations", "N/A")
+        c1.caption("Escalated -- no plan exists to verify.")
+    elif violations:
         c1.metric("Constraint violations", len(violations))
         c1.error("\n".join(violations))
     else:
@@ -313,6 +410,16 @@ def render_metrics(data: dict) -> None:
 
     c3.metric("Time to plan", f"{m.solve_seconds:.2f}s", help="Manual process: 1-2 hours")
     c4.metric("Autonomy", "Yes" if not m.escalated else "Escalated")
+
+    with st.expander(f"Run history ({len(data['history'])} runs recorded this session)"):
+        if HAS_TRACING:
+            st.caption("Neatlogs tracing: active for this process.")
+        else:
+            st.caption("Neatlogs tracing: inactive (NEATLOGS_API_KEY unset) -- metrics below are still recorded locally.")
+        if data["history"]:
+            st.dataframe(pd.DataFrame(data["history"]), hide_index=True, use_container_width=True)
+        else:
+            st.caption("No runs recorded yet.")
 
 
 def main() -> None:

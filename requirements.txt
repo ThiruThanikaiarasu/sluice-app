@@ -3,5 +3,5 @@ streamlit>=1.38
 openai>=1.50
 neatlogs[openai]==1.4.21
 pandas>=2.0
-pytest>=8.0
 python-dotenv>=1.0
+pytest>=8.0

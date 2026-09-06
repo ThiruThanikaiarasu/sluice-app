@@ -7,9 +7,26 @@ and `to_major` are the only sanctioned crossing points.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, timedelta
 from decimal import Decimal
 
 HORIZON_DAYS = 14
+
+
+def is_weekend(day_index: int, horizon_start: date) -> bool:
+    return (horizon_start + timedelta(days=day_index)).weekday() >= 5
+
+
+def next_business_day(day_index: int, horizon_start: date) -> int:
+    """Push a day index forward past any weekend.
+
+    Payment rails settle on business days only: a wire whose raw
+    send_day + settlement_days lag lands on a Saturday or Sunday actually
+    clears the next Monday, not the calendar day the lag arithmetic implies.
+    """
+    while is_weekend(day_index, horizon_start):
+        day_index += 1
+    return day_index
 
 HARD = "hard"
 SOFT = "soft"

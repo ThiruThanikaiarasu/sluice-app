@@ -95,6 +95,25 @@ LENDING_CAPACITY = {
     "MER-CA": (1_000_000, 500),
 }
 
+# entity -> (lender, undrawn committed limit in entity's own currency, annual
+# rate bps, facility document). A real, named, priced bank facility distinct
+# from any covenant measured against it -- so "draw on the revolver" points at
+# an actual instrument, not a placeholder string.
+REVOLVERS = {
+    "MER-US": ("JPMorgan", 5_000_000, 550,
+               "JPMorgan Revolving Credit Facility Agreement dated 2025-06-01"),
+    "MER-UK": ("HSBC", 1_000_000, 600,
+               "HSBC Revolving Credit Facility Letter dated 2025-04-11"),
+    "MER-DE": ("Deutsche Bank", 2_000_000, 500,
+               "Deutsche Bank Revolving Credit Facility Agreement dated 2025-05-20"),
+    "MER-IE": ("Bank of Ireland", 3_000_000, 475,
+               "BOI Revolving Credit Facility Agreement dated 2025-05-02"),
+    "MER-SG": ("DBS", 1_000_000, 600,
+               "DBS Revolving Credit Facility Letter dated 2025-07-09"),
+    "MER-CA": ("RBC", 500_000, 600,
+               "RBC Revolving Credit Facility Agreement dated 2025-03-18"),
+}
+
 FX_RATES = [
     ("EUR", "USD", 1.0850, 8),
     ("GBP", "USD", 1.2650, 10),
@@ -102,20 +121,26 @@ FX_RATES = [
 ]
 
 # entity -> (daily baseline flow, {day: (one-off amount, description)})
+#
+# Every one-off day below must land on a real business day: HORIZON_START
+# (2026-09-07) is a Monday, so days 5, 6, 12 and 13 are a weekend. Payroll,
+# invoice true-ups and receipts do not clear on a Saturday or Sunday --
+# scheduling one there is a data bug, not a feature, so spikes are pinned to
+# the nearest business day a real payment run would actually use.
 FLOWS = {
     "MER-US": (-120_000, {
         3: (2_500_000, "Enterprise renewal collection - Northwind"),
         10: (-1_200_000, "Federal estimated tax payment"),
     }),
     "MER-UK": (-45_000, {
-        5: (-2_100_000, "Monthly payroll incl. H1 bonus accrual"),
+        4: (-2_100_000, "Monthly payroll incl. H1 bonus accrual"),  # Fri 9/11, not Sat 9/12
     }),
     "MER-DE": (-60_000, {
         8: (-3_200_000, "Quarterly VAT settlement"),
-        12: (400_000, "Distributor receipt - Kellner GmbH"),
+        11: (400_000, "Distributor receipt - Kellner GmbH"),  # Fri 9/18, not Sat 9/19
     }),
     "MER-IE": (95_000, {
-        6: (-800_000, "IP amortisation true-up payment"),
+        4: (-800_000, "IP amortisation true-up payment"),  # Fri 9/11, not Sun 9/13
     }),
     "MER-SG": (-38_000, {
         9: (-600_000, "APAC contractor settlement"),
@@ -175,6 +200,14 @@ def _ic_agreements() -> list[tuple]:
     return rows
 
 
+def _revolvers() -> list[tuple]:
+    currencies = {e: c for e, _, _, c in ENTITIES}
+    return [
+        (entity_id, lender, to_minor(limit), currencies[entity_id], rate, doc)
+        for entity_id, (lender, limit, rate, doc) in REVOLVERS.items()
+    ]
+
+
 def _forecast(scenario: str) -> list[tuple]:
     rows = []
     for entity_id, (baseline, spikes) in _flows(scenario).items():
@@ -214,6 +247,8 @@ def seed(scenario: str = "base",
                      _transfer_costs())
     conn.executemany("INSERT INTO cash_forecast VALUES (?, ?, ?, ?, ?)",
                      _forecast(scenario))
+    conn.executemany("INSERT INTO revolver_facility VALUES (?, ?, ?, ?, ?, ?)",
+                     _revolvers())
     conn.executemany(
         "INSERT INTO meta VALUES (?, ?)",
         [("scenario", scenario),
@@ -233,7 +268,7 @@ def main() -> None:
     conn = seed(args.scenario, args.db)
     print(f"Seeded {args.scenario!r} -> {args.db}")
     for table in ("entity", "bank_account", "covenant", "ic_agreement",
-                  "cash_forecast", "fx_rate", "transfer_cost"):
+                  "cash_forecast", "fx_rate", "transfer_cost", "revolver_facility"):
         n = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         print(f"  {table:<16}{n:>5}")
 
