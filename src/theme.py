@@ -15,7 +15,9 @@ from __future__ import annotations
 import streamlit as st
 
 # Design tokens, mirrored from .streamlit/config.toml so the CSS below reads as
-# token names rather than loose hex literals.
+# token names rather than loose hex literals. One deliberate exception:
+# `--primary` here is the inverted button fill (near-white), not the theme's
+# `primaryColor`, which is the brand orange reserved for focus moments.
 _TOKENS = """
   --background: #0c0c09;
   --foreground: #fbfbf9;
@@ -106,7 +108,6 @@ code, pre, kbd, samp,
 [data-testid="stAppViewContainer"] *:focus-visible {
   outline: 2px solid var(--ring);
   outline-offset: 2px;
-  border-radius: 4px;
 }
 
 /* ---- Decorative edges -------------------------------------------------
