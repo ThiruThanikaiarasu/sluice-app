@@ -121,11 +121,19 @@ def _entity_covenant(conn: sqlite3.Connection, entity_id: str) -> dict | None:
 
 
 def _revolver_facility(conn: sqlite3.Connection, entity_id: str) -> dict | None:
-    row = conn.execute(
-        "SELECT entity_id, lender, limit_minor, currency, rate_bps, source_doc "
-        "FROM revolver_facility WHERE entity_id = ?",
-        (entity_id,),
-    ).fetchone()
+    """None if this entity has no seeded facility, or if `conn` points at a
+    db seeded before `revolver_facility` existed in schema.sql (that db file
+    survives across runs and branches, and `_ensure_seeded()` only seeds
+    once) -- either way, the revolver remedy is simply not offered for this
+    entity rather than raising `no such table` out of a diagnosis run."""
+    try:
+        row = conn.execute(
+            "SELECT entity_id, lender, limit_minor, currency, rate_bps, source_doc "
+            "FROM revolver_facility WHERE entity_id = ?",
+            (entity_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
     return dict(row) if row else None
 
 

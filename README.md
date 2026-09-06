@@ -45,7 +45,7 @@ It does not re-run the solver itself, so it cannot prove the plan is
   is real to the paying entity but nets to zero on group consolidation. In
   `base`, most of the saving is real: FX + fees alone are down USD 325.10
   versus the naive baseline. In `covenant_shock`, they are not: the solved
-  plan pays USD 153.02 *more* in FX + fees than the naive baseline once
+  plan pays USD 52.90 *more* in FX + fees than the naive baseline once
   interest is stripped out, trading it for a much larger interest saving that
   is invisible to the consolidated group. The app now shows both numbers
   side by side rather than only the blended total.
@@ -53,23 +53,29 @@ It does not re-run the solver itself, so it cannot prove the plan is
   soft-preference penalty allows; it is not free to leave zero headroom the
   way an earlier version was. It can still legally land exactly on a floor
   when cash is genuinely too scarce to do better — that is disclosed in
-  `binding_constraints`, not hidden.
+  `binding_constraints`, not hidden. The penalty is charged once per entity
+  against a single shared slack variable sized to that entity's worst day,
+  not once per entity per day — charging it daily would compound a
+  persisting gap into a cost an order of magnitude larger than the real FX
+  spread of actually moving cash to close it, which stops being a tie-break
+  and starts being a second objective the solver optimises against.
 
 ## Verified results
 
 | Scenario | Status | Transfers | Constraint violations | Solver cost | Naive baseline | Saved (total) | Saved (FX+fees only) |
 |---|---|---|---|---|---|---|---|
-| `base` | OPTIMAL | 4 | **0** | 2,427.55 | 4,015.24 | **39.5%** | USD 325.10 |
-| `covenant_shock` | OPTIMAL | 7 | **0** | 4,277.66 | 5,214.92 | **18.0%** | −USD 153.02 |
+| `base` | OPTIMAL | 4 | **0** | 2,414.55 | 4,015.24 | **39.9%** | USD 325.10 |
+| `covenant_shock` | OPTIMAL | 6 | **0** | 3,886.84 | 5,214.92 | **25.5%** | −USD 52.90 |
 | `infeasible` | INFEASIBLE | 0 | n/a | — | — | escalates | — |
 
-Costs are USD. Solve time: ~7s (`base`), ~18s (`covenant_shock`), ~0.1s
+Costs are USD. Solve time: ~6s (`base`), ~4s (`covenant_shock`), ~0.1s
 (`infeasible`). The full infeasible chain, including LLM diagnosis and the
 escalation memo, is ~75s — against a 1–2 hour manual process. Numbers above
-are lower than an earlier revision because the business-day fix pushes some
-transfers to a later, more expensive settlement leg and the covenant buffer
-now costs a small notional penalty when unmet — both are the plan getting
-more honest, not less optimal for the same problem.
+differ from an earlier revision for two reasons: the business-day fix pushes
+some transfers to a later, more expensive settlement leg, and an earlier cut
+of the covenant buffer charged its notional penalty once per entity *per
+day* rather than once per entity — both are the plan getting more honest,
+not less optimal for the same problem.
 
 ## How to run
 

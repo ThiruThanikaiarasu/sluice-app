@@ -38,11 +38,18 @@ BIG_M = 2_000_000_000
 PENALTY = 10**9
 
 # Target headroom above each covenant/policy floor, and the small notional
-# cost (basis points of the shortfall, same units as the FX-spread coefficient
-# below it) charged when a plan doesn't reach it. Soft: a plan can still park
-# exactly on the floor when cash is genuinely too scarce to do better, but it
-# now costs something in the objective rather than being free, so the solver
-# stops choosing zero headroom by indifference.
+# cost charged once per entity (not once per entity-day -- a single shared
+# slack variable covers that entity's worst day across the whole horizon,
+# and only that one charge enters the objective) when a plan doesn't reach
+# it anywhere. At BUFFER_PENALTY_BPS/10_000 = 0.05%, this is deliberately
+# the same order of magnitude as a single leg's one-time FX spread charge
+# (8-12bps seeded); charging it per day instead would compound to ~10x a
+# real leg's spread over a 14-day horizon and stop being a tie-break -- the
+# solver would pay genuine FX/fee cost chasing a notional buffer target.
+# Soft either way: a plan can still park exactly on the floor when cash is
+# genuinely too scarce to do better, but it now costs something in the
+# objective rather than being free, so the solver stops choosing zero
+# headroom by indifference.
 BUFFER_BPS = 500
 BUFFER_PENALTY_BPS = 5
 
@@ -394,6 +401,18 @@ def solve(conn: sqlite3.Connection, scenario: str) -> Plan:
     for e in entity_ids:
         ce = entities[e]
         buffer_target = floors.get(e, 0) + round(floors.get(e, 0) * BUFFER_BPS / 10_000)
+        # Soft preference, not a constraint: a plan that parks a balance
+        # exactly on its floor with zero headroom is legal but not something
+        # a treasurer should have to sign off on unless cash is genuinely too
+        # scarce to do better. One slack variable per entity -- not one per
+        # entity-day -- covers that entity's worst day across the whole
+        # horizon (every day's constraint below shares it, so the LP must
+        # size it to the largest gap), but it is only charged once in the
+        # objective. Charging it per day instead would compound a persisting
+        # gap into a cost many times larger than the real spread of actually
+        # moving cash to close it, which stops being a tie-break.
+        buffer_slack = pulp.LpVariable(f"buffer_slack_{e}", lowBound=0)
+        buffer_charged = False
         cum_flow = 0
         for d in range(HORIZON_DAYS):
             cum_flow += flows.get(e, {}).get(d, 0)
@@ -408,19 +427,12 @@ def solve(conn: sqlite3.Connection, scenario: str) -> Plan:
             if d >= lag_min[e]:
                 prob += expr >= floors.get(e, 0), f"floor_{e}_{d}"
                 prob += expr >= 0, f"nonneg_{e}_{d}"
-
-                # Soft preference, not a constraint: a plan that parks a
-                # balance exactly on its floor with zero headroom is legal
-                # but not something a treasurer should have to sign off on
-                # unless cash is genuinely too scarce to do better. This
-                # slack lets the solver "buy" headroom against a forecast
-                # error at a small notional cost instead of for free, without
-                # ever making an otherwise-feasible plan infeasible.
-                buffer_slack = pulp.LpVariable(f"buffer_slack_{e}_{d}", lowBound=0)
                 prob += expr + buffer_slack >= buffer_target, f"buffer_{e}_{d}"
-                objective_terms.append(
-                    buffer_slack * (BUFFER_PENALTY_BPS / 10_000) * usd_rate[ce]
-                )
+                if not buffer_charged:
+                    objective_terms.append(
+                        buffer_slack * (BUFFER_PENALTY_BPS / 10_000) * usd_rate[ce]
+                    )
+                    buffer_charged = True
 
     prob += pulp.lpSum(objective_terms)
 

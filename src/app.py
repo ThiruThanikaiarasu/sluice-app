@@ -33,6 +33,7 @@ from src.diagnosis import (
     DELAY_PAYABLE,
     REVOLVER,
     SOFT_COVENANT,
+    _split_entity_id,
     diagnose,
     record_override,
 )
@@ -153,10 +154,34 @@ def money(amount_minor: int, currency: str) -> str:
     return format_money(amount_minor, currency)
 
 
+def _ensure_decision_log_table(conn: sqlite3.Connection) -> None:
+    """`_ensure_seeded()` only seeds a scenario the first time its db file is
+    created, and that file survives across runs and across branches -- so a
+    db seeded before `decision_log` existed in schema.sql would otherwise
+    make every write/read here raise `no such table`. Same fix metrics.py
+    already uses for `run_metrics`."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS decision_log (
+            id           INTEGER PRIMARY KEY,
+            run_id       TEXT NOT NULL,
+            action       TEXT NOT NULL,
+            remedy_kind  TEXT NOT NULL,
+            entity_id    TEXT NOT NULL,
+            amount_minor INTEGER NOT NULL,
+            currency     TEXT NOT NULL,
+            decision     TEXT NOT NULL CHECK (decision IN ('approved', 'rejected')),
+            decided_at   TEXT NOT NULL
+        )
+        """
+    )
+
+
 def _log_decision(conn: sqlite3.Connection, run_id: str, remedy, decision: str) -> None:
     """Durable audit record of a treasurer's Approve/Reject click -- a UI
     toast that vanishes on rerun is not an audit trail."""
     import datetime as _dt
+    _ensure_decision_log_table(conn)
     conn.execute(
         "INSERT INTO decision_log (run_id, action, remedy_kind, entity_id, "
         "amount_minor, currency, decision, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -198,6 +223,7 @@ def decision_history(scenario: str) -> list[dict]:
     conn = _connect(scenario)
     conn.row_factory = sqlite3.Row
     try:
+        _ensure_decision_log_table(conn)
         rows = conn.execute(
             "SELECT * FROM decision_log ORDER BY id"
         ).fetchall()
@@ -339,7 +365,7 @@ def render_escalation(scenario: str, data: dict) -> None:
     }
     st.markdown("**Ranked remedies**")
     for remedy in diag.remedies:
-        entity_count = len(remedy.entity_id.split(", "))
+        entity_count = len(_split_entity_id(remedy.entity_id))
         with st.container(border=True):
             st.markdown(
                 f"**#{remedy.rank} -- {kind_label.get(remedy.kind, remedy.kind)}: "
