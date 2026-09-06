@@ -10,8 +10,6 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
-from .models import HORIZON_DAYS
-
 
 @dataclass(frozen=True)
 class Position:
@@ -56,19 +54,52 @@ def binding_floors(conn: sqlite3.Connection) -> dict[str, int]:
 
     Both bind during the solve. Only the remedy ranker, reached when the solve
     fails, is allowed to treat a soft floor as negotiable.
+
+    Everything downstream compares this against a balance in the entity's
+    functional currency (solver.py's balance expressions, opening_balances
+    below), so a covenant denominated in a different currency would be
+    compared against the wrong number without ever raising -- that failure
+    mode is checked for here instead.
     """
+    currencies = {
+        r["id"]: r["functional_currency"]
+        for r in conn.execute("SELECT id, functional_currency FROM entity")
+    }
     floors: dict[str, int] = {}
-    for r in conn.execute("SELECT entity_id, threshold FROM covenant"):
+    for r in conn.execute("SELECT entity_id, threshold, currency FROM covenant"):
+        expected = currencies.get(r["entity_id"])
+        if expected is not None and r["currency"] != expected:
+            raise ValueError(
+                f"covenant for {r['entity_id']} is denominated in "
+                f"{r['currency']}, but its functional currency is {expected}"
+            )
         floors[r["entity_id"]] = max(floors.get(r["entity_id"], 0), r["threshold"])
     return floors
 
 
 def opening_balances(conn: sqlite3.Connection) -> dict[str, int]:
-    rows = conn.execute(
-        "SELECT entity_id, SUM(balance) AS total FROM bank_account "
-        "GROUP BY entity_id"
-    )
-    return {r["entity_id"]: r["total"] for r in rows}
+    """Sum of each entity's bank account balances, in its functional currency.
+
+    Summing balances across accounts in different currencies without
+    converting would silently produce a meaningless total, so this checks
+    every account's currency matches before summing.
+    """
+    currencies = {
+        r["id"]: r["functional_currency"]
+        for r in conn.execute("SELECT id, functional_currency FROM entity")
+    }
+    totals: dict[str, int] = {}
+    for r in conn.execute(
+        "SELECT entity_id, currency, balance FROM bank_account"
+    ):
+        expected = currencies.get(r["entity_id"])
+        if expected is not None and r["currency"] != expected:
+            raise ValueError(
+                f"bank_account for {r['entity_id']} is denominated in "
+                f"{r['currency']}, but its functional currency is {expected}"
+            )
+        totals[r["entity_id"]] = totals.get(r["entity_id"], 0) + r["balance"]
+    return totals
 
 
 def project(conn: sqlite3.Connection) -> list[Position]:
@@ -105,26 +136,52 @@ def summarise(conn: sqlite3.Connection) -> dict[str, EntitySummary]:
 
     Small enough to hand to a language model whole, which is the point -- the
     raw projection is 84 rows and would crowd a 32k context for no benefit.
+
+    Every entity gets an entry, even one with no cash_forecast rows at all
+    (falls back to its opening balance/floor) -- an entity silently missing
+    from this dict would silently disappear from shortfalls()/lenders() too.
     """
+    floors = binding_floors(conn)
+    balances = opening_balances(conn)
+    currencies = {
+        r["id"]: r["functional_currency"]
+        for r in conn.execute("SELECT id, functional_currency FROM entity")
+    }
+
     worst: dict[str, Position] = {}
-    final: dict[str, Position] = {}
+    latest: dict[str, Position] = {}
     for p in project(conn):
         if p.entity_id not in worst or p.closing_balance < worst[p.entity_id].closing_balance:
             worst[p.entity_id] = p
-        if p.day == HORIZON_DAYS - 1:
-            final[p.entity_id] = p
+        # Latest day actually observed, not exactly HORIZON_DAYS - 1: an
+        # entity missing a forecast row for the final day would otherwise
+        # raise a KeyError here instead of falling back sensibly.
+        if p.entity_id not in latest or p.day > latest[p.entity_id].day:
+            latest[p.entity_id] = p
 
-    return {
-        entity_id: EntitySummary(
-            entity_id=entity_id,
-            currency=p.currency,
-            floor=p.floor,
-            min_balance=p.closing_balance,
-            worst_day=p.day,
-            closing_balance=final[entity_id].closing_balance,
-        )
-        for entity_id, p in worst.items()
-    }
+    summaries: dict[str, EntitySummary] = {}
+    for entity_id, currency in currencies.items():
+        if entity_id in worst:
+            w = worst[entity_id]
+            summaries[entity_id] = EntitySummary(
+                entity_id=entity_id,
+                currency=w.currency,
+                floor=w.floor,
+                min_balance=w.closing_balance,
+                worst_day=w.day,
+                closing_balance=latest[entity_id].closing_balance,
+            )
+        else:
+            opening = balances.get(entity_id, 0)
+            summaries[entity_id] = EntitySummary(
+                entity_id=entity_id,
+                currency=currency,
+                floor=floors.get(entity_id, 0),
+                min_balance=opening,
+                worst_day=0,
+                closing_balance=opening,
+            )
+    return summaries
 
 
 def shortfalls(conn: sqlite3.Connection) -> dict[str, EntitySummary]:

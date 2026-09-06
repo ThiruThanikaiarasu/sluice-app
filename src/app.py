@@ -22,24 +22,23 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from src import baseline, positions as positions_mod, seed, solver
+from src import baseline, metrics, positions as positions_mod, seed, solver, tracing
 from src.db import REPO_ROOT
-from src.models import to_major
+from src.diagnosis import diagnose, record_override
+from src.memo import write_escalation, write_memo
+from src.models import format_money
+from src.seed import SCENARIOS
 
+# Neatlogs traces every solve/diagnose/memo call when a NEATLOGS_API_KEY is
+# configured; without one -- or if Neatlogs itself is unreachable/misconfigured
+# -- this degrades to plain untraced calls rather than crashing the app, since
+# a trace key is an operator convenience, not a correctness requirement.
 try:
-    from src.diagnosis import diagnose, record_override
-    HAS_DIAGNOSIS = True
-except ImportError:
-    HAS_DIAGNOSIS = False
+    tracing.init()
+    HAS_TRACING = True
+except Exception:
+    HAS_TRACING = False
 
-try:
-    from src.memo import write_escalation, write_memo
-    HAS_MEMO = True
-except ImportError:
-    HAS_MEMO = False
-
-
-SCENARIOS = ("base", "covenant_shock", "infeasible")
 DB_DIR = REPO_ROOT / "data" / "app"
 
 
@@ -49,7 +48,9 @@ def _db_path(scenario: str) -> Path:
 
 
 def _connect(scenario: str) -> sqlite3.Connection:
-    return sqlite3.connect(str(_db_path(scenario)), timeout=10)
+    conn = sqlite3.connect(str(_db_path(scenario)), timeout=10)
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
 
 
 def _ensure_seeded(scenario: str) -> None:
@@ -70,11 +71,17 @@ def solve_scenario(scenario: str):
     conn = _connect(scenario)
     conn.row_factory = sqlite3.Row
     try:
-        plan = solver.solve(conn, scenario)
-        violations = solver.verify(conn, plan)
+        if HAS_TRACING:
+            plan = tracing.traced_solve(conn, scenario)
+            violations = tracing.traced_verify(conn, plan)
+        else:
+            plan = solver.solve(conn, scenario)
+            violations = solver.verify(conn, plan)
         naive = baseline.naive_plan(conn, scenario)
         summary = positions_mod.summarise(conn)
         opening = positions_mod.opening_balances(conn)
+        run_metrics = metrics.measure(conn, plan, naive)
+        metrics.persist(conn, run_metrics)
     finally:
         conn.close()
     return {
@@ -83,18 +90,21 @@ def solve_scenario(scenario: str):
         "naive": naive,
         "summary": summary,
         "opening": opening,
+        "metrics": run_metrics,
     }
 
 
 @st.cache_data(show_spinner="Diagnosing...")
 def get_diagnosis(scenario: str, version: int):
-    if not HAS_DIAGNOSIS:
-        return None
     _ensure_seeded(scenario)
     conn = _connect(scenario)
     conn.row_factory = sqlite3.Row
     try:
         plan = solver.solve(conn, scenario)
+        if HAS_TRACING:
+            return tracing.traced_diagnose(
+                lambda: diagnose(conn, plan), scenario=scenario, plan=plan
+            )
         return diagnose(conn, plan)
     finally:
         conn.close()
@@ -102,8 +112,6 @@ def get_diagnosis(scenario: str, version: int):
 
 @st.cache_data(show_spinner="Writing memo...")
 def get_memo(scenario: str, kind: str, version: int = 0):
-    if not HAS_MEMO:
-        return None
     _ensure_seeded(scenario)
     conn = _connect(scenario)
     conn.row_factory = sqlite3.Row
@@ -111,26 +119,34 @@ def get_memo(scenario: str, kind: str, version: int = 0):
         if kind == "memo":
             plan = solver.solve(conn, scenario)
             naive = baseline.naive_plan(conn, scenario)
+            if HAS_TRACING:
+                return tracing.traced_write_memo(
+                    lambda: write_memo(conn, plan, naive), scenario=scenario, plan=plan
+                )
             return write_memo(conn, plan, naive)
         diag = get_diagnosis(scenario, version)
         if diag is None:
             return None
-        return write_escalation(conn, diag)
+        return write_escalation(diag)
     finally:
         conn.close()
 
 
 def money(amount_minor: int, currency: str) -> str:
-    return f"{currency} {to_major(amount_minor):,.2f}"
+    return format_money(amount_minor, currency)
 
 
 def reject_remedy(scenario: str, remedy, reason: str, run_id: str) -> None:
-    if not HAS_DIAGNOSIS:
-        return
     conn = _connect(scenario)
     conn.row_factory = sqlite3.Row
     try:
-        record_override(conn, remedy, reason, run_id)
+        if HAS_TRACING:
+            tracing.traced_record_override(
+                lambda: record_override(conn, remedy, reason, run_id),
+                scenario=scenario, rule_text=remedy.action,
+            )
+        else:
+            record_override(conn, remedy, reason, run_id)
         conn.commit()
     finally:
         conn.close()
@@ -215,9 +231,6 @@ def render_memo(scenario: str, data: dict) -> None:
     if not plan.feasible:
         st.caption("No approval memo for an infeasible plan -- see Escalation.")
         return
-    if not HAS_MEMO:
-        st.warning("`src/memo.py` is not merged yet -- memo unavailable.")
-        return
     try:
         text = get_memo(scenario, "memo")
     except Exception as exc:  # LLM call can fail; never crash the demo screen
@@ -232,12 +245,6 @@ def render_escalation(scenario: str, data: dict) -> None:
         return
 
     st.subheader("Escalation")
-
-    if not HAS_DIAGNOSIS:
-        st.warning("`src/diagnosis.py` is not merged yet -- showing binding constraints only.")
-        for line in plan.binding_constraints:
-            st.write(f"- {line}")
-        return
 
     version = st.session_state.get(f"version:{scenario}", 0)
     run_id = f"{scenario}:v{version}"
@@ -273,16 +280,15 @@ def render_escalation(scenario: str, data: dict) -> None:
     st.markdown(f"**Recommendation:** {diag.recommendation}")
     st.caption(f"Escalate to: {diag.escalate_to}")
 
-    if HAS_MEMO:
-        st.markdown("---")
-        st.markdown("**Escalation memo**")
-        try:
-            text = get_memo(scenario, "escalation", version)
-        except Exception as exc:
-            st.error(f"Escalation memo generation failed: {exc}")
-        else:
-            if text:
-                st.markdown(text)
+    st.markdown("---")
+    st.markdown("**Escalation memo**")
+    try:
+        text = get_memo(scenario, "escalation", version)
+    except Exception as exc:
+        st.error(f"Escalation memo generation failed: {exc}")
+    else:
+        if text:
+            st.markdown(text)
 
 
 def render_metrics(data: dict) -> None:
@@ -290,6 +296,7 @@ def render_metrics(data: dict) -> None:
     plan = data["plan"]
     naive = data["naive"]
     violations = data["violations"]
+    m = data["metrics"]
 
     c1, c2, c3, c4 = st.columns(4)
 
@@ -297,15 +304,15 @@ def render_metrics(data: dict) -> None:
         c1.metric("Constraint violations", len(violations))
         c1.error("\n".join(violations))
     else:
-        c1.metric("Constraint violations", 0)
+        c1.metric("Constraint violations", m.violations)
 
     if plan.feasible and naive.feasible:
-        c2.metric("Cost saved vs. baseline", money(naive.total_cost_minor - plan.total_cost_minor, "USD"))
+        c2.metric("Cost saved vs. baseline", money(m.saved_minor, "USD"))
     else:
         c2.metric("Cost saved vs. baseline", "N/A")
 
-    c3.metric("Time to plan", f"{plan.solve_seconds:.2f}s", help="Manual process: 1-2 hours")
-    c4.metric("Autonomy", "Yes" if plan.feasible else "Escalated")
+    c3.metric("Time to plan", f"{m.solve_seconds:.2f}s", help="Manual process: 1-2 hours")
+    c4.metric("Autonomy", "Yes" if not m.escalated else "Escalated")
 
 
 def main() -> None:
@@ -325,6 +332,12 @@ def main() -> None:
     render_memo(scenario, data)
     st.divider()
     render_escalation(scenario, data)
+
+    if HAS_TRACING:
+        # Flush at the end of each script run, not just at process exit --
+        # a batched exporter that only flushes on interpreter shutdown never
+        # actually flushes in a long-lived Streamlit server process.
+        tracing.flush()
 
 
 if __name__ == "__main__":

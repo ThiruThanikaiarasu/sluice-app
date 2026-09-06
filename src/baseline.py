@@ -22,6 +22,7 @@ from .solver import (
     _entities,
     _ic_agreements,
     _net_flows,
+    _transfer_cost_for,
     _transfer_costs,
     earliest_actionable_day,
     leg_cost,
@@ -58,7 +59,7 @@ def naive_plan(conn: sqlite3.Connection, scenario: str) -> Plan:
             continue
 
         to_bank = accounts[entity_id][1]
-        fee_usd, settlement_days = costs.get((from_bank, to_bank), (0, 0))
+        fee_usd, settlement_days = _transfer_cost_for(costs, from_bank, to_bank)
         cj = entities[entity_id]
         rate_bps = agreement["rate_bps"]
 
@@ -67,6 +68,11 @@ def naive_plan(conn: sqlite3.Connection, scenario: str) -> Plan:
         # as early as possible so it lands well before the need materialises.
         needed_minor = summary.peak_shortfall
         amount_minor = int(needed_minor / quote.effective) + 1
+        # Naive still has to obey the intercompany limit -- funding past it
+        # would make the "naive" plan itself illegal, not just expensive.
+        amount_minor = min(amount_minor, agreement["max_limit"])
+        if amount_minor <= 0:
+            continue
 
         send_day = 0
         land_day = send_day + settlement_days

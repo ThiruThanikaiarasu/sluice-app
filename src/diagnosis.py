@@ -22,16 +22,15 @@ raises on a truly empty/truncated response, we do not paper over that.
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from .fx import FXTable
 from .llm import complete
-from .models import HARD, SOFT, to_major, to_minor
+from .models import HARD, SOFT, is_hard, to_major
 from .positions import summarise
-from .solver import Plan
+from .solver import FloorShortfall, Plan
 
 # --------------------------------------------------------------------------
 # Types
@@ -84,55 +83,41 @@ class Diagnosis:
 
 
 # --------------------------------------------------------------------------
-# Parsing the solver's binding_constraints into computed numbers
+# Shortfalls: structured data from the solver, not parsed prose
 # --------------------------------------------------------------------------
 
-_FLOOR_SHORT_RE = re.compile(
-    r"^(?P<entity>\S+) short (?P<amount>[\d,]+(?:\.\d+)?) (?P<currency>[A-Z]{3}) "
-    r"of its [\d,]+(?:\.\d+)? [A-Z]{3} floor on day (?P<day>\d+)"
-)
-
-
-@dataclass(frozen=True)
-class Shortfall:
-    entity_id: str
-    currency: str
-    amount_minor: int   # what could not be covered, entity's own currency
-    day: int
-    line: str            # the original binding_constraints string, verbatim
-
-
-def _parse_shortfalls(plan: Plan) -> list[Shortfall]:
-    """Pull the entity-level floor shortfalls out of `plan.binding_constraints`.
-
-    These strings are the solver's elastic-relaxation diagnosis -- the
-    authoritative source for "what is short and by how much". We do not
-    recompute this independently; that would risk a second number that
-    disagrees with the one the solver already proved.
-    """
-    out = []
-    for line in plan.binding_constraints:
-        m = _FLOOR_SHORT_RE.match(line)
-        if not m:
-            continue
-        amount_major = m.group("amount").replace(",", "")
-        out.append(Shortfall(
-            entity_id=m.group("entity"),
-            currency=m.group("currency"),
-            amount_minor=to_minor(amount_major),
-            day=int(m.group("day")),
-            line=line,
-        ))
-    return out
+# Kept as an alias so the rest of this module can keep saying "Shortfall" --
+# the type itself now lives in solver.py, built directly from the elastic
+# relaxation's numbers instead of being re-derived by parsing
+# plan.binding_constraints. A wording change to those strings (or an
+# infeasibility that is entirely IC-limit-driven, with no floor shortfall at
+# all) used to silently produce zero parsed shortfalls and crash diagnose();
+# now the numbers travel as data end to end.
+Shortfall = FloorShortfall
 
 
 def _entity_covenant(conn: sqlite3.Connection, entity_id: str) -> dict | None:
-    row = conn.execute(
+    """The entity's actually-binding covenant: the one whose threshold
+    positions.binding_floors() would pick (the max across all of the
+    entity's covenants), hard preferred only to break a tie.
+
+    The schema permits more than one covenant per entity. Sorting by
+    hardness alone (ignoring threshold) would disagree with
+    binding_floors() whenever the *soft* covenant carries the higher
+    threshold: the solver enforces that higher soft floor, but this would
+    report the entity as hard-bound and wrongly suppress a soft-covenant
+    remedy for a floor that is in fact soft. Sorting by threshold first
+    still protects the original concern -- a hard covenant with the higher
+    threshold is still selected, so a soft-breach remedy is never proposed
+    when doing so would actually cross the hard floor.
+    """
+    rows = conn.execute(
         "SELECT entity_id, kind, threshold, currency, hardness, source_doc, "
-        "source_quote FROM covenant WHERE entity_id = ?",
-        (entity_id,),
+        "source_quote FROM covenant WHERE entity_id = ? "
+        "ORDER BY threshold DESC, CASE hardness WHEN ? THEN 0 ELSE 1 END",
+        (entity_id, HARD),
     ).fetchone()
-    return dict(row) if row else None
+    return dict(rows) if rows else None
 
 
 def _payable_candidate(conn: sqlite3.Connection, entity_id: str) -> dict | None:
@@ -308,11 +293,33 @@ def _build_candidates(
     return [c for c in candidates if c is not None]
 
 
-def _deterministic_order(candidates: list[Remedy]) -> list[Remedy]:
+def _deterministic_order(candidates: list[Remedy]) -> list[int]:
+    """Indices into `candidates`, in the fallback/reference order.
+
+    Returns indices rather than the Remedy objects themselves: two candidates
+    can compare equal by value, and dataclass value-equality would then make
+    `.index()` on the result ambiguous, silently duplicating one candidate's
+    slot and dropping another's.
+    """
     return sorted(
-        candidates,
-        key=lambda r: (_KIND_PRIORITY[r.kind], -r.amount_minor, r.entity_id),
+        range(len(candidates)),
+        key=lambda i: (
+            _KIND_PRIORITY[candidates[i].kind],
+            -candidates[i].amount_minor,
+            candidates[i].entity_id,
+        ),
     )
+
+
+def _respects_priority_classes(candidates: list[Remedy], order: list[int]) -> bool:
+    """True if `order` never promotes a lower-priority kind ahead of a
+    higher-priority one (revolver < soft covenant < delay payable).
+
+    The model may re-rank freely within a priority class -- that's the part
+    of the ranking it's asked to do -- but the class ordering itself is a
+    guarantee this module makes in Python, not a suggestion to the model."""
+    ranks = [_KIND_PRIORITY[candidates[i].kind] for i in order]
+    return ranks == sorted(ranks)
 
 
 # --------------------------------------------------------------------------
@@ -406,16 +413,23 @@ def _apply_llm_result(candidates: list[Remedy], raw: str) -> tuple[list[Remedy],
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        return _deterministic_order(candidates), {}
+        data = {}
+    if not isinstance(data, dict):
+        # Valid JSON that isn't an object -- null, a bare string, a model
+        # wrapping its object in a top-level array -- would otherwise crash
+        # on data.get(...) here and again in diagnose() below.
+        data = {}
 
     n = len(candidates)
 
     ranked_ids = data.get("ranked_ids")
     if (isinstance(ranked_ids, list) and len(ranked_ids) == n
-            and set(ranked_ids) == set(range(n))):
+            and all(isinstance(i, int) and not isinstance(i, bool) for i in ranked_ids)
+            and set(ranked_ids) == set(range(n))
+            and _respects_priority_classes(candidates, ranked_ids)):
         order = ranked_ids
     else:
-        order = [candidates.index(c) for c in _deterministic_order(candidates)]
+        order = _deterministic_order(candidates)
 
     final = []
     for rank, idx in enumerate(order, start=1):
@@ -500,11 +514,17 @@ def diagnose(conn: sqlite3.Connection, plan: Plan) -> Diagnosis:
     if plan.status != "INFEASIBLE":
         raise ValueError(f"diagnose() called on a {plan.status} plan; nothing to diagnose")
 
-    shortfalls = _parse_shortfalls(plan)
+    shortfalls = list(plan.floor_shortfalls)
     if not shortfalls:
+        if plan.ic_shortfalls:
+            raise ValueError(
+                "infeasibility is driven entirely by intercompany-limit "
+                "shortfalls, with no floor shortfall to build remedies "
+                f"from: {[s.line for s in plan.ic_shortfalls]}"
+            )
         raise ValueError(
-            "no parseable floor shortfalls in plan.binding_constraints -- "
-            "cannot diagnose without at least one"
+            "INFEASIBLE plan has no floor_shortfalls -- cannot diagnose "
+            "without at least one"
         )
     shortfalls.sort(
         key=lambda s: _usd_minor(conn, s.amount_minor, s.currency), reverse=True
@@ -525,7 +545,7 @@ def diagnose(conn: sqlite3.Connection, plan: Plan) -> Diagnosis:
     primary = _primary_binding_constraint(shortfalls)
     hard_entities = [
         s.entity_id for s in shortfalls
-        if (c := _entity_covenant(conn, s.entity_id)) and c["hardness"] == HARD
+        if (c := _entity_covenant(conn, s.entity_id)) and is_hard(c)
     ]
 
     # Only ever accept the model's binding_constraint if it is a verbatim copy

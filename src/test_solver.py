@@ -9,13 +9,13 @@ from . import baseline, solver
 from .seed import seed
 
 
-def _conn(scenario):
-    return seed(scenario, db_path=f"/tmp/sluice_test_{scenario}.db")
+def _conn(scenario, tmp_path):
+    return seed(scenario, db_path=tmp_path / f"sluice_test_{scenario}.db")
 
 
 @pytest.mark.parametrize("scenario", ["base", "covenant_shock"])
-def test_solved_plan_has_no_violations(scenario):
-    conn = _conn(scenario)
+def test_solved_plan_has_no_violations(scenario, tmp_path):
+    conn = _conn(scenario, tmp_path)
     plan = solver.solve(conn, scenario)
     assert plan.status == "OPTIMAL"
     assert plan.feasible
@@ -24,8 +24,8 @@ def test_solved_plan_has_no_violations(scenario):
 
 
 @pytest.mark.parametrize("scenario", ["base", "covenant_shock"])
-def test_naive_baseline_has_no_violations_and_costs_more(scenario):
-    conn = _conn(scenario)
+def test_naive_baseline_has_no_violations_and_costs_more(scenario, tmp_path):
+    conn = _conn(scenario, tmp_path)
     solved = solver.solve(conn, scenario)
     naive = baseline.naive_plan(conn, scenario)
     assert naive.status == "OPTIMAL"
@@ -33,8 +33,8 @@ def test_naive_baseline_has_no_violations_and_costs_more(scenario):
     assert solved.total_cost_minor < naive.total_cost_minor
 
 
-def test_infeasible_scenario_reports_specific_binding_constraints():
-    conn = _conn("infeasible")
+def test_infeasible_scenario_reports_specific_binding_constraints(tmp_path):
+    conn = _conn("infeasible", tmp_path)
     plan = solver.solve(conn, "infeasible")
     assert plan.status == "INFEASIBLE"
     assert plan.transfers == ()
@@ -47,9 +47,9 @@ def test_infeasible_scenario_reports_specific_binding_constraints():
     assert solver.verify(conn, plan) == []
 
 
-def test_covenant_shock_ireland_flips_from_lender_to_borrower():
-    base_conn = _conn("base")
-    shock_conn = _conn("covenant_shock")
+def test_covenant_shock_ireland_flips_from_lender_to_borrower(tmp_path):
+    base_conn = _conn("base", tmp_path)
+    shock_conn = _conn("covenant_shock", tmp_path)
 
     base_plan = solver.solve(base_conn, "base")
     shock_plan = solver.solve(shock_conn, "covenant_shock")
