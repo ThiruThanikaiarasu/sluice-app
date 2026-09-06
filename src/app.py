@@ -30,13 +30,13 @@ from src.models import format_money
 from src.seed import SCENARIOS
 
 # Neatlogs traces every solve/diagnose/memo call when a NEATLOGS_API_KEY is
-# configured; without one this degrades to plain untraced calls rather than
-# crashing the app, since a trace key is an operator convenience, not a
-# correctness requirement.
+# configured; without one -- or if Neatlogs itself is unreachable/misconfigured
+# -- this degrades to plain untraced calls rather than crashing the app, since
+# a trace key is an operator convenience, not a correctness requirement.
 try:
     tracing.init()
     HAS_TRACING = True
-except RuntimeError:
+except Exception:
     HAS_TRACING = False
 
 DB_DIR = REPO_ROOT / "data" / "app"
