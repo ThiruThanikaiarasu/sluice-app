@@ -43,6 +43,21 @@ DELAY_PAYABLE = "delay_payable"
 
 _KIND_PRIORITY = {REVOLVER: 0, SOFT_COVENANT: 1, DELAY_PAYABLE: 2}
 
+# `Remedy.entity_id` is frozen as a single str field (see module docstring on
+# why the dataclass itself cannot change), so a consolidated remedy's entity
+# list has to round-trip through that one display string. Centralising the
+# join/split here means the separator is defined once, not re-hardcoded in
+# every builder and in `record_override`.
+_ENTITY_ID_SEP = ", "
+
+
+def _join_entity_ids(entity_ids: list[str]) -> str:
+    return _ENTITY_ID_SEP.join(entity_ids)
+
+
+def _split_entity_id(entity_id: str) -> list[str]:
+    return entity_id.split(_ENTITY_ID_SEP)
+
 
 @dataclass(frozen=True)
 class Remedy:
@@ -177,7 +192,7 @@ def _build_revolver_remedy(
         )
         total_usd_minor += _usd_minor(conn, sf.amount_minor, sf.currency)
 
-    entity_id = ", ".join(sf.entity_id for sf in shortfalls)
+    entity_id = _join_entity_ids([sf.entity_id for sf in shortfalls])
     lines = "; ".join(sf.line for sf in shortfalls)
     return Remedy(
         action=f"Draw on revolving facilities at {entity_id}",
@@ -216,7 +231,7 @@ def _build_soft_covenant_remedy(
         return None
 
     per_entity = [f"{sf.entity_id} ({covenant['source_doc']})" for sf, covenant in entries]
-    entity_id = ", ".join(sf.entity_id for sf, _ in entries)
+    entity_id = _join_entity_ids([sf.entity_id for sf, _ in entries])
     total_usd_minor = sum(_usd_minor(conn, sf.amount_minor, sf.currency) for sf, _ in entries)
     lines = "; ".join(sf.line for sf, _ in entries)
     return Remedy(
@@ -259,7 +274,7 @@ def _build_delay_payable_remedy(
         f"\"{payable['note']}\" at {sf.entity_id} (day {payable['day']})"
         for sf, payable, _ in entries
     ]
-    entity_id = ", ".join(sf.entity_id for sf, _, _ in entries)
+    entity_id = _join_entity_ids([sf.entity_id for sf, _, _ in entries])
     total_usd_minor = sum(_usd_minor(conn, amount, sf.currency) for sf, _, amount in entries)
     lines = "; ".join(sf.line for sf, _, _ in entries)
     return Remedy(
@@ -427,7 +442,7 @@ def record_override(conn: sqlite3.Connection, remedy: Remedy, reason: str, run_i
     entity's shortfall changes, even though the treasurer's actual decision
     -- "never draw the revolver for MER-CA again" -- had nothing to do with
     who else was short that day."""
-    entities = remedy.entity_id.split(", ")
+    entities = _split_entity_id(remedy.entity_id)
     constraint = {"kind": remedy.kind, "entities": entities}
     conn.execute(
         "INSERT INTO learned_rule (origin_run_id, rule_text, constraint_json, "
@@ -454,7 +469,12 @@ def learned_rules(conn: sqlite3.Connection) -> list[dict]:
 def _excluded_entities_by_kind(rules: list[dict]) -> dict[str, set[str]]:
     """kind -> set of entity ids a human has rejected that kind of remedy
     for, independent of which other entities were in the same course when
-    the rejection was recorded."""
+    the rejection was recorded.
+
+    Rules written before consolidation carry `entity_id` (a single entity,
+    the old per-entity keying) instead of `entities` -- treat that as a
+    one-element entity list rather than silently dropping the rule, so a
+    pre-existing demo database doesn't quietly lose its rejections."""
     excluded: dict[str, set[str]] = {}
     for rule in rules:
         try:
@@ -463,7 +483,10 @@ def _excluded_entities_by_kind(rules: list[dict]) -> dict[str, set[str]]:
             continue
         kind = constraint.get("kind")
         entities = constraint.get("entities")
-        if not kind or not isinstance(entities, list):
+        if not isinstance(entities, list):
+            legacy_entity_id = constraint.get("entity_id")
+            entities = [legacy_entity_id] if isinstance(legacy_entity_id, str) else None
+        if not kind or not entities:
             continue
         excluded.setdefault(kind, set()).update(entities)
     return excluded
@@ -526,17 +549,32 @@ def diagnose(conn: sqlite3.Connection, plan: Plan) -> Diagnosis:
             f"entities are short in total).{hard_note}"
         )
 
+    # Rejecting a consolidated course excludes every entity it names for
+    # that kind (record_override's docstring above), so three UI rejections
+    # -- one per kind -- can legitimately leave zero candidates. That is a
+    # real outcome (every lever has been rejected), not a bug; it must
+    # escalate with a clear message, not crash on an empty remedies[0].
     recommendation = data.get("recommendation") if isinstance(data.get("recommendation"), str) else None
     if not recommendation or not recommendation.strip():
-        top = remedies[0]
-        recommendation = (
-            f"Start with: {top.action} ({to_major(top.amount_minor)} "
-            f"{top.currency}) -- {top.business_cost}"
-        )
+        if remedies:
+            top = remedies[0]
+            recommendation = (
+                f"Start with: {top.action} ({to_major(top.amount_minor)} "
+                f"{top.currency}) -- {top.business_cost}"
+            )
+        else:
+            recommendation = (
+                "Every remedy for this shortfall has already been rejected -- "
+                "there is no lever left to recommend. This needs a manual "
+                "decision or a new remedy outside this system."
+            )
 
     escalate_to = data.get("escalate_to") if isinstance(data.get("escalate_to"), str) else None
     if not escalate_to or not escalate_to.strip():
-        escalate_to = "Group Treasurer" if any(r.requires_signoff for r in remedies) else "Treasury Director"
+        if not remedies:
+            escalate_to = "Group Treasurer"
+        else:
+            escalate_to = "Group Treasurer" if any(r.requires_signoff for r in remedies) else "Treasury Director"
 
     return Diagnosis(
         binding_constraint=binding_constraint.strip(),

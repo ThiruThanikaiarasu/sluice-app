@@ -113,6 +113,47 @@ def test_override_survives_a_changed_shortfall_set():
     )
 
 
+def test_override_is_per_entity_not_per_kind():
+    """A rejection excludes only the entities named in the rejected remedy,
+    not every entity that could ever qualify for that kind -- otherwise
+    rejecting one course would silently blind the whole lever for entities
+    the treasurer never objected to."""
+    conn, plan = _infeasible_plan()
+    first = diagnosis.diagnose(conn, plan)
+    delay_first = next(r for r in first.remedies if r.kind == diagnosis.DELAY_PAYABLE)
+    assert set(delay_first.entity_id.split(", ")) == {"MER-IE", "MER-SG", "MER-CA"}
+
+    only_mer_ca = diagnosis.Remedy(
+        action="Delay payables at MER-CA", kind=diagnosis.DELAY_PAYABLE,
+        entity_id="MER-CA", amount_minor=1, currency="USD",
+        business_cost="test", reversible=False, requires_signoff=None,
+        rank=1, rationale="test",
+    )
+    diagnosis.record_override(conn, only_mer_ca, "vendor relationship must be preserved", "run-test")
+
+    second = diagnosis.diagnose(conn, plan)
+    delay_second = next(r for r in second.remedies if r.kind == diagnosis.DELAY_PAYABLE)
+    entities = set(delay_second.entity_id.split(", "))
+    assert "MER-CA" not in entities
+    assert entities == {"MER-IE", "MER-SG"}
+
+
+def test_diagnose_does_not_crash_when_every_remedy_is_rejected():
+    """Rejecting a consolidated course excludes every entity it names for
+    that kind, so rejecting all three courses is enough to leave zero
+    candidates -- a real outcome that must escalate cleanly, not crash on
+    an empty remedies[0] recommendation fallback."""
+    conn, plan = _infeasible_plan()
+    first = diagnosis.diagnose(conn, plan)
+    for remedy in first.remedies:
+        diagnosis.record_override(conn, remedy, "rejecting every lever for this test", "run-test")
+
+    second = diagnosis.diagnose(conn, plan)
+    assert second.remedies == ()
+    assert second.recommendation.strip()
+    assert second.escalate_to.strip()
+
+
 def test_diagnose_raises_on_feasible_plan():
     conn = _conn("base", "diag_base")
     plan = solver.solve(conn, "base")
