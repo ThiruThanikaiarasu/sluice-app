@@ -84,6 +84,35 @@ def test_override_removes_rejected_remedy_from_next_run():
     assert not any(r.action == REJECTED_ACTION for r in second.remedies)
 
 
+def test_override_survives_a_changed_shortfall_set():
+    """A rejection is keyed on (kind, entity), not on the exact set of
+    entities that happened to be short in the run it was recorded in. If
+    MER-SG stops qualifying for delay_payable, the earlier rejection of
+    MER-IE and MER-CA must still hold even though the consolidated action
+    string for that kind is now different from REJECTED_ACTION."""
+    conn, plan = _infeasible_plan()
+    first = diagnosis.diagnose(conn, plan)
+    target = next(r for r in first.remedies if r.action == REJECTED_ACTION)
+    diagnosis.record_override(conn, target, "lease landlord relationship at risk", "run-test")
+
+    # MER-SG's payable no longer reads as delayable (e.g. reclassified as
+    # a statutory obligation) -- the delay_payable candidate set for this
+    # kind now covers only MER-IE and MER-CA, a different entity set than
+    # the one the rejection above was recorded against.
+    conn.execute(
+        "UPDATE cash_forecast SET note = 'tax settlement' "
+        "WHERE entity_id = 'MER-SG' AND note = 'APAC contractor settlement'"
+    )
+    conn.commit()
+
+    second = diagnosis.diagnose(conn, plan)
+    delay_remedies = [r for r in second.remedies if r.kind == diagnosis.DELAY_PAYABLE]
+    assert not delay_remedies, (
+        "MER-IE and MER-CA were already rejected for delay_payable; "
+        f"they should not resurface just because the entity set changed: {delay_remedies}"
+    )
+
+
 def test_diagnose_raises_on_feasible_plan():
     conn = _conn("base", "diag_base")
     plan = solver.solve(conn, "base")
