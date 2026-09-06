@@ -25,6 +25,18 @@ def to_major(amount: int) -> Decimal:
     return Decimal(amount) / 100
 
 
+def format_money(amount_minor: int, currency: str) -> str:
+    """150025, 'USD' -> 'USD 1,500.25'. The one shared money-display format,
+    so app.py and memo.py don't each grow their own copy that can drift."""
+    return f"{currency} {to_major(amount_minor):,.2f}"
+
+
+def is_hard(covenant: dict) -> bool:
+    """True if a covenant row (as returned by sqlite3.Row/dict) is hard --
+    i.e. no remedy may ever propose breaching it."""
+    return covenant["hardness"] == HARD
+
+
 @dataclass(frozen=True)
 class Entity:
     id: str

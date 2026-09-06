@@ -17,16 +17,13 @@ from typing import Any
 
 from . import positions
 from .llm import complete
-from .models import to_major
+from .models import format_money, to_major
 from .solver import Plan, _ic_agreements
 
 MEMO_MAX_TOKENS = 8192
 ESCALATION_MAX_TOKENS = 8192
 
-
-def _fmt_money(amount_minor: int, currency: str) -> str:
-    major = to_major(amount_minor)
-    return f"{currency} {major:,.2f}"
+_fmt_money = format_money
 
 
 def _fmt_signed_money(amount_minor: int, currency: str) -> str:
@@ -114,16 +111,28 @@ def _facts_for_memo(conn: sqlite3.Connection, plan: Plan, baseline: Plan) -> dic
     ]
 
     cost = _cost_breakdown(plan)
-    delta_minor = baseline.total_cost_minor - plan.total_cost_minor
-    pct = (delta_minor / baseline.total_cost_minor * 100) if baseline.total_cost_minor else 0.0
+    # An INFEASIBLE baseline reports total_cost_minor == 0 (see solver.solve),
+    # not "free" -- computing a delta against it would print a savings figure
+    # against a plan that was never actually costed.
+    if baseline.feasible:
+        delta_minor = baseline.total_cost_minor - plan.total_cost_minor
+        pct = (delta_minor / baseline.total_cost_minor * 100) if baseline.total_cost_minor else 0.0
+        baseline_cost = _fmt_money(baseline.total_cost_minor, "USD")
+        delta = _fmt_signed_money(delta_minor, "USD")
+        delta_pct = round(pct, 1)
+    else:
+        delta_minor = None
+        baseline_cost = "N/A (naive baseline is itself infeasible for this scenario)"
+        delta = "N/A"
+        delta_pct = None
 
     return {
         "transfers": transfers,
         "cost": {k: _fmt_money(v, "USD") for k, v in cost.items()},
-        "baseline_cost": _fmt_money(baseline.total_cost_minor, "USD"),
+        "baseline_cost": baseline_cost,
         "delta_minor": delta_minor,
-        "delta": _fmt_signed_money(delta_minor, "USD"),
-        "delta_pct": round(pct, 1),
+        "delta": delta,
+        "delta_pct": delta_pct,
         "rejected_routes": _rejected_routes(conn),
         "headroom": [
             {
@@ -188,7 +197,7 @@ COST:
 - Intercompany interest: {facts['cost']['interest_minor']}
 - Total: {facts['cost']['total_minor']}
 - Naive fund-from-HQ baseline total: {facts['baseline_cost']}
-- Savings versus baseline: {facts['delta']} ({facts['delta_pct']}%)
+- Savings versus baseline: {facts['delta']}{f" ({facts['delta_pct']}%)" if facts['delta_pct'] is not None else ""}
 
 REJECTED ROUTES (cheaper but illegal or prohibited):
 {rejected_lines}
@@ -296,6 +305,6 @@ recommended remedy and one sentence on why it outranks the others. For \
 "## Escalate to" name who must decide and by when (this horizon)."""
 
 
-def write_escalation(conn: sqlite3.Connection, diagnosis: Any) -> str:
+def write_escalation(diagnosis: Any) -> str:
     facts = _facts_for_escalation(diagnosis)
     return complete(_ESCALATION_SYSTEM, _escalation_prompt(facts), max_tokens=ESCALATION_MAX_TOKENS)

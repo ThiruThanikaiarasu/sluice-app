@@ -47,7 +47,10 @@ class FXTable:
         if direct:
             return direct
         # Cross via any currency quoted against both, paying both spreads.
-        currencies = {c for pair in self._direct for c in pair}
+        # Sorted, not a bare set iteration: set order is hash-randomized per
+        # process, so an unsorted scan can pick a different (equally valid)
+        # `via` on different runs, silently changing every downstream cost.
+        currencies = sorted({c for pair in self._direct for c in pair})
         for via in currencies:
             left, right = self._lookup(base, via), self._lookup(via, quote)
             if left and right:
@@ -59,10 +62,13 @@ class FXTable:
         """Minor units in base -> minor units in quote, after spread."""
         if base == quote:
             return amount
-        return int(amount * self.rate(base, quote).effective)
+        # round(), not int(): truncation shorts the receiving side by up to a
+        # minor unit and rounds negative amounts the wrong way (toward zero
+        # instead of toward -infinity). Matches solver.leg_cost's convention.
+        return round(amount * self.rate(base, quote).effective)
 
     def spread_cost(self, amount: int, base: str, quote: str) -> int:
         """What crossing this pair costs, in minor units of `base`."""
         if base == quote:
             return 0
-        return int(amount * self.rate(base, quote).spread_bps / 20_000)
+        return round(amount * self.rate(base, quote).spread_bps / 20_000)

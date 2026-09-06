@@ -38,6 +38,30 @@ PENALTY = 10**9
 
 
 @dataclass(frozen=True)
+class FloorShortfall:
+    """One entity's worst unmet floor, from the elastic diagnosis solve.
+
+    Carries both the structured numbers and the human-readable line so
+    downstream consumers (diagnosis.py) never have to re-derive one from the
+    other via string parsing.
+    """
+    entity_id: str
+    currency: str
+    amount_minor: int
+    day: int
+    line: str
+
+
+@dataclass(frozen=True)
+class ICShortfall:
+    lender_id: str
+    borrower_id: str
+    currency: str
+    amount_minor: int
+    line: str
+
+
+@dataclass(frozen=True)
 class Transfer:
     from_entity: str
     from_account: str
@@ -64,6 +88,8 @@ class Plan:
     solve_seconds: float
     binding_constraints: tuple[str, ...]
     closing_balances: dict[str, dict[int, int]]
+    floor_shortfalls: tuple[FloorShortfall, ...] = ()
+    ic_shortfalls: tuple[ICShortfall, ...] = ()
 
     @property
     def feasible(self) -> bool:
@@ -82,12 +108,29 @@ def _entities(conn: sqlite3.Connection) -> dict[str, str]:
 
 
 def operating_accounts(conn: sqlite3.Connection) -> dict[str, tuple[str, str, str]]:
-    """entity_id -> (account_id, bank, currency) for its operating account."""
+    """entity_id -> (account_id, bank, currency) for its operating account.
+
+    Requires exactly one per entity: silently keeping the last of several
+    (or omitting an entity with none) would route transfers through whichever
+    account happened to be picked, not the one anyone intended.
+    """
     rows = conn.execute(
         "SELECT id, entity_id, bank, currency FROM bank_account "
         "WHERE purpose = 'operating'"
-    )
-    return {r["entity_id"]: (r["id"], r["bank"], r["currency"]) for r in rows}
+    ).fetchall()
+    accounts: dict[str, tuple[str, str, str]] = {}
+    for r in rows:
+        if r["entity_id"] in accounts:
+            raise ValueError(
+                f"{r['entity_id']} has more than one 'operating' bank_account"
+            )
+        accounts[r["entity_id"]] = (r["id"], r["bank"], r["currency"])
+    missing = {
+        r["id"] for r in conn.execute("SELECT id FROM entity")
+    } - accounts.keys()
+    if missing:
+        raise ValueError(f"entities with no 'operating' bank_account: {sorted(missing)}")
+    return accounts
 
 
 def _ic_agreements(conn: sqlite3.Connection) -> dict[tuple[str, str], dict]:
@@ -116,6 +159,25 @@ def _net_flows(conn: sqlite3.Connection) -> dict[str, dict[int, int]]:
     return flows
 
 
+def _transfer_cost_for(
+    costs: dict[tuple[str, str], tuple[int, int]], from_bank: str, to_bank: str
+) -> tuple[int, int]:
+    """Look up (fixed_fee, settlement_days) for a bank pair, failing loudly.
+
+    A missing row here means the seed data (or a typo'd bank name) has a gap,
+    not that the transfer is free and instant -- silently defaulting to (0, 0)
+    would let the solver optimise against a route that cannot actually be
+    executed.
+    """
+    pair = costs.get((from_bank, to_bank))
+    if pair is None:
+        raise KeyError(
+            f"no transfer_cost row for {from_bank!r} -> {to_bank!r}; "
+            "seed data is missing this pair or a bank name is wrong"
+        )
+    return pair
+
+
 def earliest_actionable_day(
     entity_id: str,
     entity_ids: list[str],
@@ -130,6 +192,13 @@ def earliest_actionable_day(
     entity's balance already is on those days is fixed reality, not something
     any transfer decision can influence. Floor testing (and the diagnosis of
     a shortfall) is only meaningful from this day forward.
+
+    If `entity_id` has no permitted lender at all, this returns 0 rather than
+    some later day: nothing will ever arrive to help it, so its own balance
+    from day 0 onward (net of anything it chooses to lend out) is exactly as
+    real as the floor requires, and any shortfall is genuinely unfixable
+    from day 0 -- that is the correct day to start reporting it, not a grace
+    window it does not have.
     """
     lags = []
     for lender in entity_ids:
@@ -140,9 +209,8 @@ def earliest_actionable_day(
             continue
         from_bank = accounts[lender][1]
         to_bank = accounts[entity_id][1]
-        pair = costs.get((from_bank, to_bank))
-        if pair is not None:
-            lags.append(pair[1])
+        _, settlement_days = _transfer_cost_for(costs, from_bank, to_bank)
+        lags.append(settlement_days)
     return min(lags) if lags else 0
 
 
@@ -216,7 +284,7 @@ def _build_legs(entity_ids, entities, accounts, ic, costs, fx, pairs):
     for (i, j) in pairs:
         from_bank = accounts[i][1]
         to_bank = accounts[j][1]
-        fee_usd, settlement_days = costs.get((from_bank, to_bank), (0, 0))
+        fee_usd, settlement_days = _transfer_cost_for(costs, from_bank, to_bank)
         rate = fx.rate(entities[i], entities[j])
         rate_bps = ic[(i, j)]["rate_bps"]
         for d in range(HORIZON_DAYS):
@@ -332,7 +400,7 @@ def solve(conn: sqlite3.Connection, scenario: str) -> Plan:
     solve_seconds = time.monotonic() - start
 
     if status != "Optimal":
-        binding = _diagnose_infeasibility(
+        binding, floor_shortfalls, ic_shortfalls = _diagnose_infeasibility(
             entity_ids, entities, accounts, floors, opening, flows, ic, pairs,
             legs, usd_rate, lag_min,
         )
@@ -344,6 +412,8 @@ def solve(conn: sqlite3.Connection, scenario: str) -> Plan:
             solve_seconds=solve_seconds,
             binding_constraints=tuple(binding),
             closing_balances={},
+            floor_shortfalls=tuple(floor_shortfalls),
+            ic_shortfalls=tuple(ic_shortfalls),
         )
 
     transfers = tuple(_extract_transfers(entities, accounts, legs, x, fx))
@@ -354,7 +424,11 @@ def solve(conn: sqlite3.Connection, scenario: str) -> Plan:
     for e in entity_ids:
         floor = floors.get(e, 0)
         for d in range(lag_min[e], HORIZON_DAYS):
-            if closing_balances[e][d] == floor:
+            # Within 1 minor unit, not exact equality: closing_balances is
+            # re-derived through leg_cost's round(), which can differ from
+            # the LP's full-float value by a unit even when the LP treated
+            # the floor as exactly binding.
+            if abs(closing_balances[e][d] - floor) <= 1:
                 binding.append(f"{e} floor tight (={to_major(floor)} {entities[e]}) on day {d}")
     for (i, j) in pairs:
         total_lent = sum(t.amount_minor for t in transfers if t.from_entity == i and t.to_entity == j)
@@ -376,7 +450,7 @@ def solve(conn: sqlite3.Connection, scenario: str) -> Plan:
 def _diagnose_infeasibility(
     entity_ids, entities, accounts, floors, opening, flows, ic, pairs, legs,
     usd_rate, lag_min,
-) -> list[str]:
+) -> tuple[list[str], list[FloorShortfall], list[ICShortfall]]:
     """Solve the elastic relaxation and report exactly which constraints, and
     by how much, could not be satisfied."""
     prob = pulp.LpProblem("sluice_diagnosis", pulp.LpMinimize)
@@ -396,7 +470,12 @@ def _diagnose_infeasibility(
         fx_coef = (meta["rate"].spread_bps / 20_000) * usd_rate[ci]
         days_out = max(0, HORIZON_DAYS - meta["land_day"])
         interest_coef = (meta["rate_bps"] / 10_000) * (days_out / 365) * usd_rate[ci]
-        objective_terms.append(x[key] * (fx_coef + interest_coef + meta["fee_usd"] / 1000))
+        # Fee is per-leg, not per-unit, and there's no binary "used this leg"
+        # indicator in this relaxation to attach it to. Scale it down by
+        # BIG_M rather than an arbitrary small constant so it stays a
+        # negligible tie-break against real fx/interest coefficients
+        # (~1e-4 per unit) instead of dwarfing them.
+        objective_terms.append(x[key] * (fx_coef + interest_coef + meta["fee_usd"] / BIG_M))
 
     balance_expr = {e: {} for e in entity_ids}
     for e in entity_ids:
@@ -436,27 +515,40 @@ def _diagnose_infeasibility(
         if val > 0.5 and val > worst_by_entity.get(e, (None, 0))[1]:
             worst_by_entity[e] = (d, val)
 
-    binding = []
+    binding: list[str] = []
+    floor_shortfalls: list[FloorShortfall] = []
     for e, (d, val) in sorted(worst_by_entity.items()):
-        binding.append(
-            f"{e} short {to_major(round(val))} {entities[e]} of its "
+        amount = round(val)
+        line = (
+            f"{e} short {to_major(amount)} {entities[e]} of its "
             f"{to_major(floors.get(e, 0))} {entities[e]} floor on day {d} "
             "even after routing all available, permitted intercompany capacity"
         )
+        binding.append(line)
+        floor_shortfalls.append(FloorShortfall(
+            entity_id=e, currency=entities[e], amount_minor=amount, day=d, line=line,
+        ))
+
+    ic_shortfalls: list[ICShortfall] = []
     for (i, j), slack in sorted(ic_slack.items()):
         val = slack.value() or 0
         if val > 0.5:
-            binding.append(
+            amount = round(val)
+            line = (
                 f"{i}->{j} intercompany limit of {to_major(ic[(i, j)]['max_limit'])} "
-                f"{entities[i]} is {to_major(round(val))} short of what the plan needed to route"
+                f"{entities[i]} is {to_major(amount)} short of what the plan needed to route"
             )
+            binding.append(line)
+            ic_shortfalls.append(ICShortfall(
+                lender_id=i, borrower_id=j, currency=entities[i], amount_minor=amount, line=line,
+            ))
 
     if not binding:
         binding.append(
             "solve failed with no isolable shortfall found by the elastic "
             "relaxation -- check for a modelling bug"
         )
-    return binding
+    return binding, floor_shortfalls, ic_shortfalls
 
 
 # --------------------------------------------------------------------------
