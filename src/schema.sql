@@ -60,6 +60,7 @@ CREATE TABLE ic_agreement (
     borrower_id TEXT NOT NULL REFERENCES entity(id),
     max_limit   INTEGER NOT NULL,         -- minor units, lender currency
     rate_bps    INTEGER NOT NULL,         -- annual, basis points
+    term_days   INTEGER NOT NULL,         -- loan matures this many days after it lands
     permitted   INTEGER NOT NULL CHECK (permitted IN (0, 1)),
     reason      TEXT,
     PRIMARY KEY (lender_id, borrower_id)

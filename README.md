@@ -33,22 +33,54 @@ It does not re-run the solver itself, so it cannot prove the plan is
 - Covenant floors are enforced from each entity's `earliest_actionable_day`
   — the first day a transfer sent today could physically land, given the
   fastest permitted lender's settlement lag. Balances before that day cannot
-  be influenced by any plan built today, so "zero violations" means zero
-  violations from the first day a plan could act, not from day zero.
-- Settlement now respects a business-day calendar: a wire is never initiated
-  or landed on a weekend, and the horizon's calendar is checked against real
+  be *improved* by any plan built today, so "zero violations" means zero
+  violations from the first day a plan could act, not from day zero. That
+  exemption only ever covers what a plan cannot influence: an entity's own
+  outbound sends are within the plan's control from day 0, and both the
+  solver and `verify()` now hold a plan to its baseline (zero-transfer)
+  balance on those early days, not just to the floor — a plan may never use
+  the exemption to leave an entity worse off than doing nothing at all. The
+  UI's headline "Constraint violations" and "Cost saved vs. baseline" tiles
+  now carry this same qualifier and a pointer to the FX-only figure, instead
+  of only being explained here.
+- Settlement now respects a business-day *and* public-holiday calendar (via
+  the `holidays` package, keyed off each entity's `country`): a wire is never
+  initiated or landed on a weekend or a bank holiday in either the sending or
+  receiving country, and the horizon's calendar is checked against real
   dates rather than assumed to always fall on a business day (an earlier
   version scheduled UK payroll and two other cash events on a Saturday or
-  Sunday — that was a data bug, now fixed). No holiday calendar is modelled
-  yet, only weekends.
-- The objective minimises total cost *including* intercompany interest, which
-  is real to the paying entity but nets to zero on group consolidation. In
-  `base`, most of the saving is real: FX + fees alone are down USD 325.10
-  versus the naive baseline. In `covenant_shock`, they are not: the solved
-  plan pays USD 52.90 *more* in FX + fees than the naive baseline once
-  interest is stripped out, trading it for a much larger interest saving that
-  is invisible to the consolidated group. The app now shows both numbers
-  side by side rather than only the blended total.
+  Sunday — that was a data bug, now fixed). Weekends-only was itself a gap:
+  a wire between Ireland and Germany scheduled to land on 26 December would
+  not actually land — now fixed the same way the weekend bug was.
+- Covenants here mean minimum-cash floors only, and they are tested
+  continuously (daily), which is a real, common covenant type and matches
+  the actual facility text seeded for each entity (e.g. "Unrestricted Cash
+  at no time less than €2,000,000"). Leverage, DSCR, interest-cover, and
+  other ratio covenants — typically tested at period end against
+  consolidated financials, not daily — are not represented at all. This is
+  a scope limit, not a hidden one: the UI now says so next to the floor
+  table it applies to.
+- The solve is now lexicographic, not one blended objective: phase 1
+  minimises real group cost (FX spread + wire fees, on both the draw and any
+  repayment) and phase 2, holding that real cost at its optimum, minimises
+  intercompany interest as a tie-break only. Interest is real to the paying
+  entity but nets to zero on group consolidation, so it can no longer buy
+  its way into "optimal" by trading away real FX/fee cost the way a single
+  blended objective allowed. `total_cost_minor` (what's reported and what
+  the headline "Cost saved vs. baseline" tile shows) still adds interest
+  back in for disclosure, so it is not the same number phase 1 optimised —
+  the app's "Group-consolidated saving" figure, not the headline tile, is
+  the real cash the group saves. In `base` that's USD 395.10 of the total
+  saving; in `covenant_shock` the solved plan actually pays USD 26.26 *more*
+  in FX + fees than the naive baseline once interest is stripped out, buying
+  a much larger interest saving that is invisible to the consolidated group.
+  (An earlier build tried a single MILP with a heavily-weighted combined
+  objective instead of two solves, to avoid solving twice -- reverted: a
+  weight large enough to guarantee the ordering spans ~9 orders of magnitude
+  against the interest terms, and that coefficient spread pushed CBC's
+  solve time on `covenant_shock` from ~2.5s past a minute. Two
+  well-conditioned solves is faster in practice than one badly-conditioned
+  one.)
 - The solver drives each entity toward its floor only as far as a small
   soft-preference penalty allows; it is not free to leave zero headroom the
   way an earlier version was. It can still legally land exactly on a floor
@@ -59,23 +91,85 @@ It does not re-run the solver itself, so it cannot prove the plan is
   persisting gap into a cost an order of magnitude larger than the real FX
   spread of actually moving cash to close it, which stops being a tie-break
   and starts being a second objective the solver optimises against.
+- The solver is a MILP with one binary leg-activation variable per
+  (entity-pair, day): ~300 binaries at 6 entities over the 14-day horizon,
+  solved by CBC in well under a second to a few seconds depending on
+  scenario (see the solve times in the results table below — two solves
+  now, not one, per the lexicographic split above). That does not linearly
+  extend to the ~10 banks the pitch describes — 20 entities is roughly
+  5,300 binaries, well past where CBC solves comfortably in a demo, and the
+  two-solve split makes that ceiling closer, not further. Scaling past this
+  would mean decomposing by entity cluster, warm-starting from the previous
+  day's plan, or moving to a commercial MILP solver; none of that is
+  implemented yet.
+- Every intercompany loan now has a real maturity (`ic_agreement.term_days`,
+  a single disclosed 7-day assumption for every pair -- there is no
+  per-pair contractual term in the seed data to draw a more granular number
+  from) and, when that maturity and its own settlement lag both land inside
+  the 14-day horizon, a mandatory repayment leg: the borrower pays principal
+  + accrued interest back to the lender, converting at its own cost the same
+  way the forward draw does. `verify()` independently re-derives whether
+  each loan should have repaid and checks the repayment's own day and
+  amount, not just that one exists. The app and memo show which loans repaid
+  within the horizon and which remain outstanding beyond it, so this isn't
+  only visible by reading `interest_minor` and inferring it.
+  Two things are still simplified, on purpose: the naive baseline does not
+  model repayment at all (see the baseline note below), and neither seeded
+  scenario's chosen routes happen to mature in time for a repayment to
+  actually appear on screen -- the mechanism is exercised by dedicated
+  tests instead. A shorter term was tried specifically to make it visible
+  in `base`/`covenant_shock` and reverted (see below).
+- The naive baseline still prices every loan as if it stays open through
+  the whole horizon, even though it carries the same real maturity a
+  solver-drawn loan would. This was tried the honest way -- pricing naive's
+  loans against their real term and scheduling their repayment too -- and
+  reverted: naive sizes each draw to cover only the *peak* shortfall, with
+  no mechanism to also plan for paying that draw back, and once repayment
+  was priced in, naive's own repayment pushed at least one entity below its
+  floor and made the naive baseline itself INFEASIBLE in a seeded scenario.
+  That is a real result (naive treasury practice really can create a
+  repayment crisis it never saw coming) but a materially bigger change than
+  a repayment-scheduling fix should carry — it needs either a naive baseline
+  that also prices its own repayment risk or a loan-rollover mechanism,
+  and neither is implemented. Until then, naive's cost is a real
+  understatement, and the solved plan's advantage over it is, if anything,
+  larger than the numbers below show.
+- Explicitly out of scope, not modelled at all: withholding tax and
+  transfer-pricing/arm's-length documentation on cross-border intercompany
+  interest; thin-capitalisation limits; bank cut-off times (a transfer
+  landing on "day 2" assumes it clears any time that day, not before a
+  specific cutoff); and forecast uncertainty (`cash_forecast` is a single
+  deterministic point estimate, so a plan reporting "USD 0.00 headroom" on
+  some day states a precision no cash forecast actually has).
+- The design moves cash via discrete intercompany wires rather than a
+  notional pool or a physical header-account sweep, which is the more
+  common mechanism at this group size in practice. Wires were chosen here
+  because each one is a fully auditable, individually-costed, individually
+  approvable transaction — the same property that makes `verify()` and the
+  approval memo possible per-transfer. A pooling structure would need a
+  different model entirely (participation agreements, an interest
+  set-off formula, daily sweep timing) and was out of scope for this build.
 
 ## Verified results
 
 | Scenario | Status | Transfers | Constraint violations | Solver cost | Naive baseline | Saved (total) | Saved (FX+fees only) |
 |---|---|---|---|---|---|---|---|
-| `base` | OPTIMAL | 4 | **0** | 2,414.55 | 4,015.24 | **39.9%** | USD 325.10 |
-| `covenant_shock` | OPTIMAL | 6 | **0** | 3,886.84 | 5,214.92 | **25.5%** | −USD 52.90 |
+| `base` | OPTIMAL | 2 | **0** | 2,616.04 | 3,756.83 | **30.4%** | USD 395.10 |
+| `covenant_shock` | OPTIMAL | 4 | **0** | 4,259.47 | 4,878.45 | **12.7%** | −USD 26.26 |
 | `infeasible` | INFEASIBLE | 0 | n/a | — | — | escalates | — |
 
-Costs are USD. Solve time: ~6s (`base`), ~4s (`covenant_shock`), ~0.1s
+Costs are USD. Solve time: ~0.4s (`base`), ~2.5s (`covenant_shock`), ~0.1s
 (`infeasible`). The full infeasible chain, including LLM diagnosis and the
 escalation memo, is ~75s — against a 1–2 hour manual process. Numbers above
-differ from an earlier revision for two reasons: the business-day fix pushes
-some transfers to a later, more expensive settlement leg, and an earlier cut
-of the covenant buffer charged its notional penalty once per entity *per
-day* rather than once per entity — both are the plan getting more honest,
-not less optimal for the same problem.
+differ from an earlier revision for several reasons, all the plan getting
+more honest rather than less optimal for the same problem: the business-day
+fix pushed some transfers to a later, more expensive settlement leg; an
+earlier cut of the covenant buffer charged its notional penalty once per
+entity *per day* rather than once per entity; and the objective is now
+lexicographic (real FX+fee cost first, intercompany interest only as a
+tie-break) with a real per-loan holiday-aware settlement calendar and a
+real loan maturity, all of which changes which combination of legs is
+actually cheapest.
 
 ## How to run
 

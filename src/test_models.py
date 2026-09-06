@@ -9,9 +9,23 @@ from __future__ import annotations
 
 from datetime import date
 
-from .models import is_weekend, next_business_day
+from .models import (
+    is_bank_holiday,
+    is_settlement_day,
+    is_weekend,
+    next_business_day,
+    next_settlement_day,
+)
 
 MONDAY = date(2026, 9, 7)
+
+# Tuesday. day_index 3 -> 2026-12-25 (Friday, a genuine non-weekend holiday
+# in both DE and US: Christmas Day) -- and day_index 4 -> 2026-12-26
+# (Saturday, which happens to also be DE/IE Boxing Day / St. Stephen's Day,
+# but not a US holiday). Day 3 is what distinguishes a holiday check from a
+# weekend check; day 4's DE/US asymmetry is what distinguishes "holiday in
+# *any* of the leg's two countries" from a single shared calendar.
+DEC_TUESDAY = date(2026, 12, 22)
 
 
 def test_is_weekend_identifies_saturday_and_sunday():
@@ -49,3 +63,32 @@ def test_a_friday_send_with_a_two_day_lag_lands_monday_not_sunday():
     # already a weekend send day like the two cases above.
     send_day, settlement_days = 4, 2
     assert next_business_day(send_day + settlement_days, MONDAY) == 7
+
+
+def test_is_bank_holiday_true_only_for_a_country_that_observes_it():
+    de = frozenset({"DE"})
+    us = frozenset({"US"})
+    assert is_bank_holiday(3, DEC_TUESDAY, de)   # Dec 25, DE Christmas
+    assert is_bank_holiday(3, DEC_TUESDAY, us)   # Dec 25, US Christmas
+    assert is_bank_holiday(4, DEC_TUESDAY, de)   # Dec 26, DE Boxing Day
+    assert not is_bank_holiday(4, DEC_TUESDAY, us)  # Dec 26, not a US holiday
+
+
+def test_is_settlement_day_checks_any_country_on_the_leg():
+    # A DE<->US leg cannot clear on Dec 25 even though it is a plain Friday,
+    # weekend-wise -- the entire point of the fix: is_weekend alone would
+    # have said this day is fine.
+    pair = frozenset({"DE", "US"})
+    assert not is_settlement_day(3, DEC_TUESDAY, pair)
+    # A weekday with no holiday on either side clears normally.
+    assert is_settlement_day(0, DEC_TUESDAY, pair)
+
+
+def test_next_settlement_day_skips_a_holiday_that_next_business_day_would_miss():
+    pair = frozenset({"DE", "IE"})
+    # day 3 = Dec 25, Fri (DE/IE Christmas holiday, not a weekend) --
+    # next_business_day is blind to it and reports the day itself as fine.
+    # day 4/5 = Sat 26th/Sun 27th are the weekend (also DE/IE Boxing Day,
+    # redundantly). Day 6 = Mon 28th is the first day that actually clears.
+    assert next_business_day(3, DEC_TUESDAY) == 3  # blind to the holiday
+    assert next_settlement_day(3, DEC_TUESDAY, pair) == 6
