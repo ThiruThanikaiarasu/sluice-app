@@ -64,21 +64,47 @@ def _db_path(scenario: str) -> Path:
 
 
 def _connect(scenario: str) -> sqlite3.Connection:
+    """The single entry point for a scenario's db connection.
+
+    Guarantees the schema is seeded before returning, regardless of which
+    caller connects first. `decision_history()`/`approve_remedy()` used to
+    call `sqlite3.connect` directly: on a scenario whose db file had never
+    been seeded, that silently created an empty file, `_ensure_seeded`'s old
+    file-existence check saw the file already "there" and skipped seeding
+    forever, and the schema never got created -- bricking that scenario's db
+    with only a `decision_log` table in it. Routing every connection through
+    here removes the possibility of a caller forgetting to seed first.
+    """
+    _ensure_seeded(scenario)
     conn = sqlite3.connect(str(_db_path(scenario)), timeout=10)
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
 def _ensure_seeded(scenario: str) -> None:
-    """Seed this scenario's db file if it doesn't exist yet.
+    """Seed this scenario's db file if its schema isn't there yet.
+
+    Checked by querying for the `entity` table, not by file existence:
+    `sqlite3.connect` creates an empty file on first touch, so any caller
+    that opened a connection before seeding (see `_connect`'s docstring)
+    would otherwise permanently look "already seeded" despite having no
+    schema at all.
 
     Seeding wipes `learned_rule`, so once a scenario has been seeded this run
     the override loop (Reject -> record_override -> re-diagnose) keeps
     accumulating on the same file instead of losing its state every rerun.
     """
-    if _db_path(scenario).exists():
+    path = _db_path(scenario)
+    probe = sqlite3.connect(str(path))
+    try:
+        has_schema = probe.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='entity'"
+        ).fetchone() is not None
+    finally:
+        probe.close()
+    if has_schema:
         return
-    seed.seed(scenario, db_path=_db_path(scenario)).close()
+    seed.seed(scenario, db_path=path).close()
 
 
 @st.cache_data(show_spinner="Solving...")
@@ -274,6 +300,15 @@ def render_positions(data: dict) -> None:
         hide_index=True,
         use_container_width=True,
     )
+    st.caption(
+        "\"Floor\" here is each entity's minimum-cash covenant, tested "
+        "continuously per its own facility text (e.g. \"at no time less "
+        "than...\") -- that is a real, common covenant type, correctly "
+        "modelled as a daily check. This is the only covenant type Sluice "
+        "models: leverage, DSCR, interest-cover and other ratio covenants, "
+        "typically tested at period end against consolidated accounts, are "
+        "not represented at all."
+    )
 
 
 def render_plan(data: dict) -> None:
@@ -331,6 +366,54 @@ def render_plan(data: dict) -> None:
         )
     else:
         st.caption("Naive baseline is itself infeasible for this scenario -- no comparable cost.")
+
+    if plan.repayments:
+        st.markdown("**Intercompany loans repaid within the horizon**")
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "Borrower": r.borrower_id,
+                    "Lender": r.lender_id,
+                    "Pay day": r.pay_day,
+                    "Principal": money(r.principal_minor, r.currency),
+                    "Interest": money(r.interest_minor, r.currency),
+                    "Total repaid": money(r.total_minor, r.currency),
+                }
+                for r in sorted(plan.repayments, key=lambda r: r.pay_day)
+            ]),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    unclaimed = list(plan.repayments)
+    ic_totals: dict[tuple[str, str], tuple[int, str]] = {}
+    for t in plan.transfers:
+        match = solver.repayment_for_transfer(t, tuple(unclaimed))
+        if match is not None:
+            unclaimed.remove(match)
+            continue
+        key = (t.from_entity, t.to_entity)
+        prior_amount, _ = ic_totals.get(key, (0, t.amount_currency))
+        ic_totals[key] = (prior_amount + t.amount_minor, t.amount_currency)
+    if ic_totals:
+        st.markdown("**Intercompany balances outstanding at day 14**")
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "Lender": lender,
+                    "Borrower": borrower,
+                    "Outstanding": money(amount, currency),
+                }
+                for (lender, borrower), (amount, currency) in sorted(ic_totals.items())
+            ]),
+            hide_index=True,
+            use_container_width=True,
+        )
+        st.caption(
+            "These loans mature beyond what the horizon and settlement "
+            "calendar allow to repay in time -- no repayment date is "
+            "modelled for them, unlike the loans repaid above."
+        )
 
 
 def render_memo(scenario: str, data: dict) -> None:
@@ -442,9 +525,19 @@ def render_metrics(data: dict) -> None:
         c1.error("\n".join(violations))
     else:
         c1.metric("Constraint violations", m.violations)
+        c1.caption(
+            "Counted from each entity's earliest day a transfer sent today "
+            "could land -- a pre-existing dip before that day, which no "
+            "plan could have prevented, is not in this count."
+        )
 
     if plan.feasible and naive.feasible:
         c2.metric("Cost saved vs. baseline", money(m.saved_minor, "USD"))
+        c2.caption(
+            "Includes intercompany interest, which nets to zero on group "
+            "consolidation. See \"Group-consolidated saving\" under Plan "
+            "for the real cash the group saves."
+        )
     else:
         c2.metric("Cost saved vs. baseline", "N/A")
 

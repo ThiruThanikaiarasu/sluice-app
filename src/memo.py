@@ -18,7 +18,7 @@ from typing import Any
 from . import positions
 from .llm import complete
 from .models import format_money, to_major
-from .solver import Plan, _ic_agreements
+from .solver import Plan, _ic_agreements, repayment_for_transfer
 
 MEMO_MAX_TOKENS = 8192
 ESCALATION_MAX_TOKENS = 8192
@@ -77,6 +77,62 @@ def _headroom(conn: sqlite3.Connection, plan: Plan) -> list[dict]:
             "headroom_minor": headroom_minor,
         })
     rows.sort(key=lambda r: r["headroom_minor"])
+    return rows
+
+
+def _ic_outstanding(conn: sqlite3.Connection, plan: Plan) -> list[dict]:
+    """Amount lent per (lender, borrower) pair by this plan that is still
+    outstanding at the end of the horizon -- loans this plan also scheduled
+    a repayment for (because their maturity fit inside the horizon) are
+    excluded here and appear in `_ic_repaid` instead.
+
+    A loan that never matures within the horizon has interest charged
+    through the horizon's last day as if it stays open that whole time,
+    and nothing schedules the money back -- that is a real intercompany
+    receivable/payable a CFO needs to see named, not a number silently
+    absorbed into "the plan cost X".
+    """
+    names = _entity_names(conn)
+    currencies = {r["id"]: r["functional_currency"] for r in conn.execute(
+        "SELECT id, functional_currency FROM entity"
+    )}
+    unclaimed = list(plan.repayments)
+    totals: dict[tuple[str, str], int] = {}
+    for t in plan.transfers:
+        match = repayment_for_transfer(t, tuple(unclaimed))
+        if match is not None:
+            unclaimed.remove(match)
+            continue
+        key = (t.from_entity, t.to_entity)
+        totals[key] = totals.get(key, 0) + t.amount_minor
+    rows = []
+    for (lender, borrower), amount in sorted(totals.items()):
+        rows.append({
+            "lender_id": lender,
+            "lender_name": names.get(lender, lender),
+            "borrower_id": borrower,
+            "borrower_name": names.get(borrower, borrower),
+            "amount": _fmt_money(amount, currencies.get(lender, "USD")),
+        })
+    return rows
+
+
+def _ic_repaid(conn: sqlite3.Connection, plan: Plan) -> list[dict]:
+    """Loans this plan both drew and repaid within the horizon -- the
+    other half of the intercompany picture from `_ic_outstanding`."""
+    names = _entity_names(conn)
+    rows = []
+    for r in sorted(plan.repayments, key=lambda r: (r.pay_day, r.lender_id, r.borrower_id)):
+        rows.append({
+            "lender_id": r.lender_id,
+            "lender_name": names.get(r.lender_id, r.lender_id),
+            "borrower_id": r.borrower_id,
+            "borrower_name": names.get(r.borrower_id, r.borrower_id),
+            "pay_day": r.pay_day,
+            "principal": _fmt_money(r.principal_minor, r.currency),
+            "interest": _fmt_money(r.interest_minor, r.currency),
+            "total": _fmt_money(r.total_minor, r.currency),
+        })
     return rows
 
 
@@ -145,6 +201,8 @@ def _facts_for_memo(conn: sqlite3.Connection, plan: Plan, baseline: Plan) -> dic
             for r in _headroom(conn, plan)
         ],
         "binding_constraints": list(plan.binding_constraints),
+        "ic_outstanding": _ic_outstanding(conn, plan),
+        "ic_repaid": _ic_repaid(conn, plan),
     }
 
 
@@ -180,9 +238,23 @@ def _memo_prompt(facts: dict[str, Any]) -> str:
 
     binding_lines = "\n".join(f"- {b}" for b in facts["binding_constraints"]) or "- None."
 
+    ic_lines = "\n".join(
+        f"- {r['lender_name']} ({r['lender_id']}) is owed {r['amount']} by "
+        f"{r['borrower_name']} ({r['borrower_id']}), no repayment date modelled for it"
+        for r in facts["ic_outstanding"]
+    ) or "- None: every loan this plan drew is either repaid within the horizon or none was drawn."
+
+    ic_repaid_lines = "\n".join(
+        f"- {r['borrower_name']} ({r['borrower_id']}) repays {r['lender_name']} "
+        f"({r['lender_id']}) on day {r['pay_day']}: principal {r['principal']} + "
+        f"interest {r['interest']} = {r['total']}"
+        for r in facts["ic_repaid"]
+    ) or "- None: no loan this plan drew matures within the horizon."
+
     return f"""Write the approval memo with exactly these sections, in this \
 order: "## Decision", "## What moves", "## What it costs", \
-"## What was rejected and why", "## Constraints that came close to binding".
+"## What was rejected and why", "## Constraints that came close to binding", \
+"## Intercompany balances outstanding at day 14".
 
 Facts (all numbers final, copy exactly):
 
@@ -208,13 +280,25 @@ BINDING CONSTRAINTS THIS PLAN SATISFIES EXACTLY (its tightest points):
 HEADROOM AGAINST EACH ENTITY'S FLOOR, TIGHTEST FIRST:
 {headroom_lines}
 
+LOANS THIS PLAN DREW AND ALSO REPAYS WITHIN THE HORIZON:
+{ic_repaid_lines}
+
+LOANS THIS PLAN DREW THAT REMAIN OUTSTANDING AT DAY 14 (mature beyond what \
+the horizon and settlement calendar allow to repay in time):
+{ic_lines}
+
 For "## What moves" render a markdown table with columns: From, To, Amount, \
 Currency, Send day, Land day. For "## What it costs" state the four cost \
 lines then the savings-versus-baseline line as its own sentence, verbatim \
 numbers. For "## What was rejected and why" explain each rejected route \
 using its quoted reason; if there are none, say so in one sentence. For \
 "## Constraints that came close to binding" list the tightest 1-3 floors and \
-what happens if forecast flows worsen slightly."""
+what happens if forecast flows worsen slightly. For "## Intercompany \
+balances outstanding at day 14" first list any loans that repay within the \
+horizon with their pay day and amounts, then separately list any that \
+remain outstanding beyond day 14 with no repayment date modelled -- keep \
+the two groups distinct and do not invent a repayment date for the second \
+group."""
 
 
 def write_memo(conn: sqlite3.Connection, plan: Plan, baseline: Plan) -> str:

@@ -188,6 +188,29 @@ def _transfer_costs() -> list[tuple]:
     return rows
 
 
+# Every intercompany loan matures 7 days after it lands, regardless of
+# lender or borrower -- there is no per-pair contractual term in the seed
+# data to draw a more granular number from, and fabricating one would be
+# less honest than a single disclosed assumption.
+#
+# A shorter term (5 days) was tried to make the repayment mechanic visible
+# in `base`/`covenant_shock` directly, and reverted: it surfaced a real
+# asymmetry between the solved plan (which must actually pay real FX+fee
+# cost on the repayment leg once required) and the naive baseline (which
+# does not model repayment at all, so never bears that cost) -- comparing
+# them then means comparing an honest cost to an understated one, and in
+# one seeded scenario it drove the naive baseline itself INFEASIBLE (its
+# one-shot peak-shortfall sizing has no mechanism for planning around its
+# own future repayment). That is a real, interesting finding, but a much
+# larger change than a repayment-scheduling patch should carry -- it needs
+# either a naive baseline that also prices its own repayment or a loan
+# rollover mechanism, neither implemented here. 7 days means neither
+# seeded scenario's chosen routes happen to mature in time, so the
+# mechanism is exercised by dedicated tests instead of by `base`/
+# `covenant_shock` -- correct and tested, not merely untriggered by luck.
+IC_TERM_DAYS = 7
+
+
 def _ic_agreements() -> list[tuple]:
     rows = []
     for lender, (limit, rate) in LENDING_CAPACITY.items():
@@ -195,7 +218,7 @@ def _ic_agreements() -> list[tuple]:
             if lender == borrower:
                 continue
             reason = PROHIBITED.get((lender, borrower))
-            rows.append((lender, borrower, to_minor(limit), rate,
+            rows.append((lender, borrower, to_minor(limit), rate, IC_TERM_DAYS,
                          0 if reason else 1, reason))
     return rows
 
@@ -240,7 +263,7 @@ def seed(scenario: str = "base",
         [(e, k, to_minor(t), c, h, d, q)
          for e, k, t, c, h, d, q in _covenants(scenario)],
     )
-    conn.executemany("INSERT INTO ic_agreement VALUES (?, ?, ?, ?, ?, ?)",
+    conn.executemany("INSERT INTO ic_agreement VALUES (?, ?, ?, ?, ?, ?, ?)",
                      _ic_agreements())
     conn.executemany("INSERT INTO fx_rate VALUES (?, ?, ?, ?)", FX_RATES)
     conn.executemany("INSERT INTO transfer_cost VALUES (?, ?, ?, ?)",

@@ -15,11 +15,12 @@ import time
 
 from .db import horizon_start
 from .fx import FXTable
-from .models import HORIZON_DAYS, next_business_day
+from .models import HORIZON_DAYS, next_settlement_day
 from .positions import binding_floors, opening_balances, shortfalls
 from .solver import (
     Plan,
     Transfer,
+    _countries,
     _entities,
     _ic_agreements,
     _net_flows,
@@ -47,6 +48,7 @@ def naive_plan(conn: sqlite3.Connection, scenario: str) -> Plan:
     costs = _transfer_costs(conn)
     fx = FXTable(conn)
     hstart = horizon_start(conn)
+    countries = _countries(conn)
 
     from_bank = accounts[FUNDER][1]
     ci = entities[FUNDER]
@@ -76,17 +78,36 @@ def naive_plan(conn: sqlite3.Connection, scenario: str) -> Plan:
         if amount_minor <= 0:
             continue
 
-        # Wires are not initiated or landed on a non-business day -- same
+        # Wires are not initiated or landed on a non-settlement day -- same
         # rule the solver applies in _build_legs, so the naive baseline's
         # cost is genuinely comparable rather than quietly cheaper because
-        # it assumed a weekend settlement the real solver would never take.
-        send_day = next_business_day(0, hstart)
-        land_day = next_business_day(send_day + settlement_days, hstart)
+        # it assumed a weekend or holiday settlement the real solver would
+        # never take.
+        pair_countries = frozenset({countries[FUNDER], countries[entity_id]})
+        send_day = next_settlement_day(0, hstart, pair_countries)
+        land_day = next_settlement_day(send_day + settlement_days, hstart, pair_countries)
         if land_day > HORIZON_DAYS - 1:
             continue
 
+        # The naive baseline funds and forgets: unlike the solved plan, it
+        # never schedules a repayment, so its interest is priced as if the
+        # loan stays open through the whole horizon -- not a bug, a real
+        # difference in repayment discipline between "route everything
+        # through HQ and don't think about it again" and an actual plan.
+        #
+        # This is also, honestly, a simplification in naive's favour: a
+        # loan drawn this way still carries the same contractual maturity
+        # as a solver-drawn one, and a real treasury desk that ignored it
+        # could face the same repayment-vs-floor conflict `solve()` now
+        # prices in. Modelling that here was tried and reverted -- sizing
+        # a naive draw to survive its own future repayment needs a forecast
+        # of the repayment itself, which naive's one-shot peak-shortfall
+        # sizing has no mechanism for, and it turned every seeded scenario's
+        # baseline INFEASIBLE, which is a real result but too large a
+        # change to fold into a repayment-modelling patch. Flagged as a
+        # follow-up, not silently dropped.
         landed, fx_cost, fee, interest = leg_cost(
-            amount_minor, ci, cj, rate_bps, land_day, fee_usd, fx
+            amount_minor, ci, cj, rate_bps, max(0, HORIZON_DAYS - land_day), fee_usd, fx
         )
         transfers.append(Transfer(
             from_entity=FUNDER,
