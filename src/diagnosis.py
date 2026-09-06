@@ -153,9 +153,13 @@ def _payable_candidate(conn: sqlite3.Connection, entity_id: str) -> dict | None:
 # optionally a combination), never per-entity duplicates.
 # --------------------------------------------------------------------------
 
-def _build_revolver_remedy(conn: sqlite3.Connection, shortfalls: list[Shortfall]) -> Remedy | None:
+def _build_revolver_remedy(
+    conn: sqlite3.Connection, shortfalls: list[Shortfall], excluded: set[str],
+) -> Remedy | None:
     """Always offered, cheap and reversible, never touches the covenant
-    itself -- so every shortfall entity qualifies."""
+    itself -- so every shortfall entity qualifies, minus any entity a human
+    has already rejected a revolver draw for."""
+    shortfalls = [sf for sf in shortfalls if sf.entity_id not in excluded]
     if not shortfalls:
         return None
 
@@ -189,18 +193,22 @@ def _build_revolver_remedy(conn: sqlite3.Connection, shortfalls: list[Shortfall]
         requires_signoff=None,
         rank=0,
         rationale=(
-            "Cheapest and fully reversible option; covers every shortfall "
-            f"in full. Against: {lines}"
+            "Cheapest and fully reversible option, assuming each entity's "
+            f"facility has undrawn headroom to cover its shortfall. Against: {lines}"
         ),
     )
 
 
-def _build_soft_covenant_remedy(conn: sqlite3.Connection, shortfalls: list[Shortfall]) -> Remedy | None:
+def _build_soft_covenant_remedy(
+    conn: sqlite3.Connection, shortfalls: list[Shortfall], excluded: set[str],
+) -> Remedy | None:
     """Only entities whose OWN floor is soft qualify. Never constructed for a
     hard covenant -- this is the structural guarantee that a hard breach can
     never appear in `remedies`, enforced here rather than left to the model."""
     entries = []
     for sf in shortfalls:
+        if sf.entity_id in excluded:
+            continue
         covenant = _entity_covenant(conn, sf.entity_id)
         if covenant and covenant["hardness"] == SOFT:
             entries.append((sf, covenant))
@@ -232,10 +240,14 @@ def _build_soft_covenant_remedy(conn: sqlite3.Connection, shortfalls: list[Short
     )
 
 
-def _build_delay_payable_remedy(conn: sqlite3.Connection, shortfalls: list[Shortfall]) -> Remedy | None:
+def _build_delay_payable_remedy(
+    conn: sqlite3.Connection, shortfalls: list[Shortfall], excluded: set[str],
+) -> Remedy | None:
     """Only entities with a genuine, non-statutory payable to delay qualify."""
     entries = []
     for sf in shortfalls:
+        if sf.entity_id in excluded:
+            continue
         payable = _payable_candidate(conn, sf.entity_id)
         if payable is not None:
             amount = min(sf.amount_minor, payable["amount_minor"])
@@ -268,11 +280,15 @@ def _build_delay_payable_remedy(conn: sqlite3.Connection, shortfalls: list[Short
     )
 
 
-def _build_candidates(conn: sqlite3.Connection, shortfalls: list[Shortfall]) -> list[Remedy]:
+def _build_candidates(
+    conn: sqlite3.Connection, shortfalls: list[Shortfall],
+    excluded_by_kind: dict[str, set[str]] | None = None,
+) -> list[Remedy]:
+    excluded_by_kind = excluded_by_kind or {}
     candidates = [
-        _build_revolver_remedy(conn, shortfalls),
-        _build_soft_covenant_remedy(conn, shortfalls),
-        _build_delay_payable_remedy(conn, shortfalls),
+        _build_revolver_remedy(conn, shortfalls, excluded_by_kind.get(REVOLVER, set())),
+        _build_soft_covenant_remedy(conn, shortfalls, excluded_by_kind.get(SOFT_COVENANT, set())),
+        _build_delay_payable_remedy(conn, shortfalls, excluded_by_kind.get(DELAY_PAYABLE, set())),
     ]
     return [c for c in candidates if c is not None]
 
@@ -404,18 +420,22 @@ def _apply_llm_result(candidates: list[Remedy], raw: str) -> tuple[list[Remedy],
 # --------------------------------------------------------------------------
 
 def record_override(conn: sqlite3.Connection, remedy: Remedy, reason: str, run_id: str) -> None:
-    constraint = {
-        "kind": remedy.kind,
-        "entity_id": remedy.entity_id,
-        "action": remedy.action,
-    }
+    """Reject every entity named in `remedy` for `remedy.kind`, not the exact
+    consolidated action string. A course of action is a comma-joined list of
+    whichever entities happened to be short in this run; keying on that
+    string would mean the rejection stops applying the moment any other
+    entity's shortfall changes, even though the treasurer's actual decision
+    -- "never draw the revolver for MER-CA again" -- had nothing to do with
+    who else was short that day."""
+    entities = remedy.entity_id.split(", ")
+    constraint = {"kind": remedy.kind, "entities": entities}
     conn.execute(
         "INSERT INTO learned_rule (origin_run_id, rule_text, constraint_json, "
         "created_at) VALUES (?, ?, ?, ?)",
         (
             run_id,
-            f"Do not recommend '{remedy.action}' for {remedy.entity_id} "
-            f"({remedy.kind}). Rejected: {reason}",
+            f"Do not recommend {remedy.kind} remedies for {', '.join(entities)} "
+            f"(rejected course: '{remedy.action}'). Reason: {reason}",
             json.dumps(constraint),
             datetime.now(timezone.utc).isoformat(),
         ),
@@ -431,17 +451,22 @@ def learned_rules(conn: sqlite3.Connection) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def _excluded_by_learned_rules(candidate: Remedy, rules: list[dict]) -> bool:
+def _excluded_entities_by_kind(rules: list[dict]) -> dict[str, set[str]]:
+    """kind -> set of entity ids a human has rejected that kind of remedy
+    for, independent of which other entities were in the same course when
+    the rejection was recorded."""
+    excluded: dict[str, set[str]] = {}
     for rule in rules:
         try:
             constraint = json.loads(rule["constraint_json"])
         except (json.JSONDecodeError, TypeError):
             continue
-        if (constraint.get("kind") == candidate.kind
-                and constraint.get("entity_id") == candidate.entity_id
-                and constraint.get("action") == candidate.action):
-            return True
-    return False
+        kind = constraint.get("kind")
+        entities = constraint.get("entities")
+        if not kind or not isinstance(entities, list):
+            continue
+        excluded.setdefault(kind, set()).update(entities)
+    return excluded
 
 
 # --------------------------------------------------------------------------
@@ -462,9 +487,9 @@ def diagnose(conn: sqlite3.Connection, plan: Plan) -> Diagnosis:
         key=lambda s: _usd_minor(conn, s.amount_minor, s.currency), reverse=True
     )
 
-    candidates = _build_candidates(conn, shortfalls)
     rules = learned_rules(conn)
-    candidates = [c for c in candidates if not _excluded_by_learned_rules(c, rules)]
+    excluded_by_kind = _excluded_entities_by_kind(rules)
+    candidates = _build_candidates(conn, shortfalls, excluded_by_kind)
 
     total_shortfall_minor = sum(
         _usd_minor(conn, s.amount_minor, s.currency) for s in shortfalls

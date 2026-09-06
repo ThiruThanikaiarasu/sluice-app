@@ -48,15 +48,16 @@ the escalation memo, is ~75s — against a 1–2 hour manual process.
 ## How to run
 
 ```
-cd code-base
 pip install -r requirements.txt
 cp .env.example .env        # add TensorMux + Neatlogs keys
 python -m src.seed --scenario base
 streamlit run src/app.py
 ```
 
-Modules sit flat in `src/` and import as `src.<module>`. Scenarios are
-`base`, `covenant_shock`, and `infeasible`.
+Run from the repo root (cloning `sluice-app` already puts you there —
+`requirements.txt` and `src/` are at the top level, there is no `code-base`
+subdirectory to `cd` into). Modules sit flat in `src/` and import as
+`src.<module>`. Scenarios are `base`, `covenant_shock`, and `infeasible`.
 
 ## The agent workflow, and how AO was used
 
