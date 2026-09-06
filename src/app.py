@@ -22,7 +22,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from src import baseline, metrics, positions as positions_mod, seed, solver, tracing
+from src import baseline, metrics, positions as positions_mod, seed, solver, theme, tracing
 from src.db import REPO_ROOT
 from src.diagnosis import diagnose, record_override
 from src.memo import write_escalation, write_memo
@@ -172,7 +172,7 @@ def render_positions(data: dict) -> None:
         })
 
     def highlight(row):
-        color = "background-color: #4a1a1a" if row["Breaches floor"] else ""
+        color = "background-color: #301917" if row["Breaches floor"] else ""
         return [color] * len(row)
 
     table = pd.DataFrame(rows)
@@ -317,6 +317,7 @@ def render_metrics(data: dict) -> None:
 
 def main() -> None:
     st.set_page_config(page_title="Sluice", layout="wide")
+    theme.apply()
     st.title("Sluice -- multi-entity cash positioning")
 
     scenario = st.selectbox("Scenario", SCENARIOS, key="scenario")
